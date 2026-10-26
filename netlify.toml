@@ -1,0 +1,30 @@
+# Configuración de Netlify para Perfil 360 AI
+# NO desplegar hasta recibir aprobación explícita.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# Redirección SPA: todas las rutas de React Router sirven index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+  # Excluye las rutas de API para que no sean capturadas por el fallback SPA
+  force = false
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  # Las funciones llevan sus propias dependencias; se resuelven desde el package.json raíz.
+
+# Nota: los secretos (HEYGEN_API_KEY, FIREBASE_SERVICE_ACCOUNT, etc.) se configuran
+# en Netlify UI > Site settings > Environment variables. NUNCA en este archivo.
+
+[dev]
+  # `npm run dev` debe servir las Functions junto con Vite; Vite aislado no
+  # resuelve las rutas /api/*.
+  framework = "vite"
+  command = "npm run dev:vite"
+  targetPort = 5173
+  port = 8888

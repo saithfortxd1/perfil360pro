@@ -1,0 +1,46 @@
+{
+  "name": "perfil360-ai",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Perfil 360 AI - plataforma de perfil profesional asistida por IA",
+  "scripts": {
+    "dev": "netlify dev",
+    "dev:vite": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "typecheck:functions": "tsc -p netlify/tsconfig.json",
+    "verify:heygen-config": "node scripts/verify-heygen-config.cjs",
+    "verify:heygen-auth": "node scripts/verify-heygen-auth.cjs",
+    "verify:interviewer-playback": "node scripts/verify-interviewer-playback.cjs",
+    "verify:avatars": "node scripts/verify-avatar-profiles.cjs",
+    "verify:dashboard": "node scripts/verify-dashboard.cjs",
+    "verify:pcm": "node scripts/verify-pcm.cjs",
+    "verify:gemini": "node scripts/verify-gemini-api.cjs",
+    "verify:profile": "node scripts/verify-profile-flow.cjs"
+  },
+  "dependencies": {
+    "@heygen/liveavatar-web-sdk": "^0.0.19",
+    "firebase": "^13.1.0",
+    "firebase-admin": "12.7.0",
+    "lucide-react": "^1.61.0",
+    "motion": "^14.6.0",
+    "pdfjs-dist": "^6.4.299",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^6.0.3",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "netlify-cli": "^23.15.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

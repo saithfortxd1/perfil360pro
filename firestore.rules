@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ========================================================================
+    // Funciones helper
+    // ========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function allowedProfileFields() {
+      return ['fullName', 'headline', 'bio', 'goal', 'skills', 'yearsOfExperience', 'updatedAt'].toSet();
+    }
+
+    function allowedUserProfileFields() {
+      return ['uid', 'email', 'displayName', 'role', 'createdAt', 'updatedAt', 'lastEvaluation'].toSet();
+    }
+
+    function validLastEvaluation(data) {
+      return !('lastEvaluation' in data) || (
+        data.lastEvaluation is map
+        && data.lastEvaluation.keys().hasOnly(['score', 'strengths', 'improvements', 'summary', 'evaluatedAt'])
+        && data.lastEvaluation.keys().hasAll(['score', 'strengths', 'improvements', 'summary', 'evaluatedAt'])
+        && data.lastEvaluation.score is int
+        && data.lastEvaluation.score >= 1
+        && data.lastEvaluation.score <= 100
+        && data.lastEvaluation.strengths is list
+        && data.lastEvaluation.strengths.size() <= 20
+        && data.lastEvaluation.improvements is list
+        && data.lastEvaluation.improvements.size() <= 20
+        && data.lastEvaluation.summary is string
+        && data.lastEvaluation.summary.size() <= 4000
+        && data.lastEvaluation.evaluatedAt is int
+        && data.lastEvaluation.evaluatedAt >= 0
+      );
+    }
+
+    // ========================================================================
+    // Colección: users/{uid}
+    // Perfiles de usuario - cada usuario accede solo al suyo
+    // ========================================================================
+    match /users/{userId} {
+      // Lectura: solo el propietario o admin
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Creación: solo durante registro (autenticación ya verificada)
+      // El documento se crea desde el servidor con ensureUserProfile
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(allowedUserProfileFields())
+        && !('lastEvaluation' in request.resource.data)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == 'candidate'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      // Actualización: solo campos permitidos, nunca el rol
+      allow update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(allowedUserProfileFields())
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.role == resource.data.role  // NUNCA cambiar rol desde cliente
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && validLastEvaluation(request.resource.data);
+
+      // Eliminación: solo admin
+      allow delete: if isAdmin();
+    }
+
+    // ========================================================================
+    // Colección: profiles/{uid} (perfiles profesionales existentes)
+    // ========================================================================
+    match /profiles/{profileId} {
+      // Lectura: solo el propietario
+      allow read: if isOwner(profileId);
+
+      // Creación y actualización: solo campos permitidos, solo propietario
+      allow create, update: if isOwner(profileId)
+        && request.resource.data.keys().hasOnly(allowedProfileFields())
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() <= 80
+        && request.resource.data.bio is string
+        && request.resource.data.bio.size() <= 1200
+        && request.resource.data.skills is list
+        && request.resource.data.skills.size() <= 30
+        && request.resource.data.yearsOfExperience is int
+        && request.resource.data.yearsOfExperience >= 0
+        && request.resource.data.yearsOfExperience <= 60;
+
+      allow delete: if false;
+    }
+
+    // ========================================================================
+    // Colección: rateLimits/{hashedUid} (para límites de API de IA)
+    // ========================================================================
+    match /rateLimits/{limitId} {
+      allow read, write: if false; // Solo funciones de servidor
+    }
+
+    // ========================================================================
+    // Por defecto: denegar todo acceso no explícito
+    // ========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
