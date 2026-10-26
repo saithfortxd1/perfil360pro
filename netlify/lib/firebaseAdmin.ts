@@ -22,25 +22,54 @@ export function getAdminApp(): App {
     return cachedApp;
   }
 
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT?.trim();
   if (!raw) {
     throw new Error('FIREBASE_SERVICE_ACCOUNT no configurado en el entorno del servidor');
   }
 
-  let serviceAccount: Record<string, string>;
+  // Quitar comillas envolventes si fueron añadidas en la UI de Netlify
+  if (
+    (raw.startsWith("'") && raw.endsWith("'")) ||
+    (raw.startsWith('"') && raw.endsWith('"'))
+  ) {
+    raw = raw.slice(1, -1).trim();
+  }
+
+  // Soporte para JSON codificado en Base64
+  if (!raw.startsWith('{')) {
+    try {
+      const decoded = Buffer.from(raw, 'base64').toString('utf8').trim();
+      if (decoded.startsWith('{')) {
+        raw = decoded;
+      }
+    } catch {
+      // Si no es Base64, continúa con el valor original
+    }
+  }
+
+  let serviceAccount: Record<string, unknown>;
   try {
-    serviceAccount = JSON.parse(raw) as Record<string, string>;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error();
+    }
+    serviceAccount = parsed as Record<string, unknown>;
   } catch {
     throw new Error('FIREBASE_SERVICE_ACCOUNT no es un JSON válido');
   }
 
-  const configuredProjectId = process.env.FIREBASE_PROJECT_ID?.trim() || 'perfil360-8c837';
-  if (
-    typeof serviceAccount.project_id !== 'string' ||
-    serviceAccount.project_id.trim() !== configuredProjectId
-  ) {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT no corresponde al FIREBASE_PROJECT_ID configurado');
+  const explicitProjectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  const serviceAccountProjectId = typeof serviceAccount.project_id === 'string' ? serviceAccount.project_id.trim() : '';
+
+  if (!serviceAccountProjectId) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT no contiene un project_id válido');
   }
+
+  if (explicitProjectId && serviceAccountProjectId !== explicitProjectId) {
+    throw new Error(`FIREBASE_SERVICE_ACCOUNT project_id (${serviceAccountProjectId}) no corresponde al FIREBASE_PROJECT_ID configurado (${explicitProjectId})`);
+  }
+
+  const finalProjectId = explicitProjectId || serviceAccountProjectId;
 
   // Las claves privadas en variables de entorno suelen traer \n escapados
   if (typeof serviceAccount.private_key === 'string') {
@@ -49,7 +78,7 @@ export function getAdminApp(): App {
 
   cachedApp = initializeApp({
     credential: cert(serviceAccount as Parameters<typeof cert>[0]),
-    projectId: serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID || 'perfil360-8c837',
+    projectId: finalProjectId,
   });
 
   return cachedApp;
@@ -78,9 +107,10 @@ export async function verifyFirebaseToken(
   let auth: Auth;
   try {
     auth = getAdminAuth();
-  } catch {
-    console.error('[firebase-admin] configuración de autenticación del servidor inválida.');
-    return { ok: false, reason: 'configuration-error' };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[firebase-admin] configuración de autenticación del servidor inválida: ${message}`);
+    return { ok: false, reason: 'configuration-error', code: message };
   }
 
   try {
