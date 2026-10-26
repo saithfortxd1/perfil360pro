@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "typecheck:functions": "tsc -p netlify/tsconfig.json",
+    "verify:firebase-config": "node scripts/verify-firebase-config.cjs",
     "verify:heygen-config": "node scripts/verify-heygen-config.cjs",
     "verify:heygen-auth": "node scripts/verify-heygen-auth.cjs",
     "verify:interviewer-playback": "node scripts/verify-interviewer-playback.cjs",

@@ -21,7 +21,13 @@ export interface FirebaseEnvironment {
   readonly appCheckSiteKey: string | null;
 }
 
-const REQUIRED_KEYS = ['apiKey', 'authDomain', 'storageBucket', 'messagingSenderId', 'appId'] as const;
+const REQUIRED_ENV_VALUES = [
+  { name: 'VITE_FIREBASE_API_KEY', valueKey: 'apiKey' },
+  { name: 'VITE_FIREBASE_AUTH_DOMAIN', valueKey: 'authDomain' },
+  { name: 'VITE_FIREBASE_STORAGE_BUCKET', valueKey: 'storageBucket' },
+  { name: 'VITE_FIREBASE_MESSAGING_SENDER_ID', valueKey: 'messagingSenderId' },
+  { name: 'VITE_FIREBASE_APP_ID', valueKey: 'appId' },
+] as const;
 
 export function readFirebaseEnvironment(): Result<FirebaseEnvironment> {
   const env = import.meta.env;
@@ -34,13 +40,15 @@ export function readFirebaseEnvironment(): Result<FirebaseEnvironment> {
     appId: env.VITE_FIREBASE_APP_ID?.trim() ?? '',
   };
 
-  const missing = REQUIRED_KEYS.filter((key) => values[key].length === 0);
+  const missing = REQUIRED_ENV_VALUES
+    .filter(({ valueKey }) => values[valueKey].length === 0)
+    .map(({ name }) => name);
 
   if (missing.length > 0) {
     return fail(
       new AppError(
         ErrorCode.CONFIG,
-        'Firebase no está configurado en este entorno. Copia .env.example a .env.local y completa las variables VITE_FIREBASE_*.',
+        `Falta configuración pública de Firebase en esta compilación: ${missing.join(', ')}. Añade estas variables en Netlify (Environment variables, ámbito de build) y vuelve a compilar. En local, configúralas en .env.local. No añadas credenciales privadas a variables VITE_*.`,
         { details: { missing } },
       ),
     );
