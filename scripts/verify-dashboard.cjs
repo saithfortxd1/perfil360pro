@@ -10,6 +10,7 @@ const cv = read('src/services/cvIngestionService.ts');
 const history = read('src/services/simulationHistory.ts');
 const simulator = read('src/pages/SimuladorInmersivo.tsx');
 const auth = read('src/contexts/AuthContext.tsx');
+const brand = read('src/components/ui/BrandMark.tsx');
 
 const checks = [
   ['dashboard includes profile, CV upload, history, and simulator navigation',
@@ -32,6 +33,8 @@ const checks = [
   ['dashboard sign-out uses the auth context and returns to login',
     page.includes('const signedOut = await signOut()') && page.includes('navigate(paths.login, { replace: true })') &&
     auth.includes('const result = await endSession()') && auth.includes('return false')],
+  ['brand icon has explicit mobile-safe dimensions and contrast independent of inherited color',
+    brand.includes('shrink-0') && brand.includes('text-signal-300') && brand.includes('className="size-[72%]"')],
 ];
 
 for (const [label, condition] of checks) {
