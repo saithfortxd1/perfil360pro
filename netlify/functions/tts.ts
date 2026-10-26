@@ -28,10 +28,14 @@ export default async function handler(request: Request, _context: Context): Prom
     return errorResponse('La solicitud supera el tamaño permitido.', 413, origin, 'payload-too-large');
   }
 
-  const uid = await verifyFirebaseToken(request.headers.get('authorization'));
-  if (!uid) {
+  const authentication = await verifyFirebaseToken(request.headers.get('authorization'));
+  if (!authentication.ok) {
+    if (authentication.reason === 'configuration-error') {
+      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error');
+    }
     return errorResponse('Debes iniciar sesión para usar la voz del entrevistador.', 401, origin, 'unauthenticated');
   }
+  const uid = authentication.uid;
 
   let text: string | undefined;
   let interviewerId: 'james' | 'olivia' | 'mateo' | undefined;

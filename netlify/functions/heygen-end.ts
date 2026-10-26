@@ -20,8 +20,11 @@ export default async function handler(request: Request, _context: Context): Prom
     return errorResponse('Método no permitido.', 405, origin);
   }
 
-  const uid = await verifyFirebaseToken(request.headers.get('authorization'));
-  if (!uid) {
+  const authentication = await verifyFirebaseToken(request.headers.get('authorization'));
+  if (!authentication.ok) {
+    if (authentication.reason === 'configuration-error') {
+      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error');
+    }
     return errorResponse('Debes iniciar sesión.', 401, origin, 'unauthenticated');
   }
 

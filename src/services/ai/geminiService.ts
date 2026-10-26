@@ -102,12 +102,12 @@ class GeminiService {
   /**
    * Genera contenido mediante la función autenticada del servidor.
    */
-  async generateContent(prompt: string): Promise<{ ok: true; value: string } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  async generateContent(prompt: string, signal?: AbortSignal): Promise<{ ok: true; value: string } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
     if (!this.isConfigured()) {
       return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false } };
     }
 
-    return this.requestText({ prompt });
+    return this.requestText({ prompt }, signal);
   }
 
   /**
@@ -418,7 +418,8 @@ class GeminiService {
    * Con reintento automático con prompt simplificado si falla
    */
   async generateScenariosFromProfile(
-    userProfile: { fullName?: string; skills?: string[]; yearsOfExperience?: number; headline?: string; bio?: string; goal?: string }
+    userProfile: { fullName?: string; skills?: string[]; yearsOfExperience?: number; headline?: string; bio?: string; goal?: string },
+    signal?: AbortSignal,
   ): Promise<{ ok: true; value: { id: string; title: string; description: string; difficulty: string }[] } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
     if (!this.isConfigured()) {
       return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false } };
@@ -505,25 +506,51 @@ No incluyas texto fuera del JSON.`;
       return validScenarios;
     };
 
-    // Primer intento con prompt completo
+    const shouldRetryGeneration = (code: string) =>
+      code !== 'QUOTA_EXCEEDED' &&
+      code !== 'UNAUTHENTICATED' &&
+      code !== 'CONFIG_MISSING' &&
+      code !== 'ABORTED';
+
     try {
-      const result = await this.generateContent(buildPrompt(false));
+      const result = await this.generateContent(buildPrompt(false), signal);
 
       if (!result.ok) {
-        throw new Error(result.error.message);
+        if (!shouldRetryGeneration(result.error.code)) {
+          return { ok: false, error: result.error };
+        }
+        throw Object.assign(new Error(result.error.message), { code: result.error.code });
       }
 
       const scenarios = parseScenarios(result.value);
       return { ok: true, value: scenarios };
     } catch (firstError) {
+      const firstCode = typeof firstError === 'object' && firstError !== null && 'code' in firstError
+        ? String((firstError as { code: unknown }).code)
+        : '';
       console.error('[GeminiService] Primer intento falló:', firstError instanceof Error ? firstError.message : String(firstError));
+      if (!shouldRetryGeneration(firstCode)) {
+        return {
+          ok: false,
+          error: {
+            message: firstError instanceof Error ? firstError.message : 'Error al generar escenarios',
+            code: firstCode || 'GENERATION_ERROR',
+            retryable: false,
+          },
+        };
+      }
 
-      // Segundo intento con prompt simplificado
       try {
-        const retryResult = await this.generateContent(buildPrompt(true));
+        const retryResult = await this.generateContent(buildPrompt(true), signal);
 
         if (!retryResult.ok) {
-          throw new Error(retryResult.error.message);
+          return {
+            ok: false,
+            error: {
+              ...retryResult.error,
+              retryable: shouldRetryGeneration(retryResult.error.code) && retryResult.error.retryable,
+            },
+          };
         }
 
         const scenarios = parseScenarios(retryResult.value);
@@ -601,26 +628,82 @@ No incluyas texto fuera del JSON.`;
 
   // ==================== MÉTODOS PRIVADOS ====================
 
+  private mapFunctionError(
+    status: number,
+    result: { error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } } | null,
+  ): { message: string; code: string; retryable: boolean } {
+    const code = typeof result?.error?.code === 'string' ? result.error.code : 'UNKNOWN_ERROR';
+    const retryAfterSeconds = typeof result?.error?.retryAfterSeconds === 'number' ? result.error.retryAfterSeconds : null;
+    const isUnauthenticated = code === 'unauthenticated' || code.startsWith('unauthenticated:');
+    const mappedCode = code === 'resource-exhausted' ? 'QUOTA_EXCEEDED'
+      : isUnauthenticated ? 'UNAUTHENTICATED'
+        : code === 'network-error' ? 'NETWORK_ERROR'
+          : code === 'configuration-error' ? 'CONFIG_MISSING'
+            : code === 'invalid-argument' ? 'INVALID_RESPONSE'
+              : code.toUpperCase().replaceAll('-', '_');
+    const defaultMessage = mappedCode === 'QUOTA_EXCEEDED'
+      ? 'Se agotó la cuota del servicio de IA. Espera o revisa el uso del proyecto.'
+      : `Error del servicio de IA (${status}).`;
+    let message = typeof result?.error?.message === 'string' ? result.error.message : defaultMessage;
+    if (code.startsWith('unauthenticated:')) {
+      const diagnostic = code.replace('unauthenticated:', '');
+      console.warn(`[GeminiService] Validación de sesión Firebase fallida: ${diagnostic}`);
+      if (diagnostic === 'auth/id-token-expired') {
+        message = 'Tu sesión de Firebase expiró. Inicia sesión nuevamente con Google para renovarla.';
+      } else if (diagnostic === 'auth/argument-error' || diagnostic === 'auth/invalid-id-token') {
+        message = 'Tu sesión de Google no coincide con el proyecto de Firebase configurado en el servidor.';
+      }
+    }
+    const retryable = mappedCode !== 'QUOTA_EXCEEDED'
+      && mappedCode !== 'UNAUTHENTICATED'
+      && mappedCode !== 'CONFIG_MISSING'
+      && status >= 500;
+    if (mappedCode === 'QUOTA_EXCEEDED' && retryAfterSeconds && retryAfterSeconds > 0 && retryAfterSeconds <= 120) {
+      return {
+        message: `El servicio de IA pidió esperar ${retryAfterSeconds} segundos antes de reintentar.`,
+        code: mappedCode,
+        retryable: false,
+      };
+    }
+    return { message, code: mappedCode, retryable };
+  }
+
   private async requestText(
     body: { prompt: string } | { contents: GeminiContent[] },
     signal?: AbortSignal,
   ): Promise<{ ok: true; value: string } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
-    const idToken = await getFirebaseIdToken();
+    let idToken = await getFirebaseIdToken();
     if (!idToken) {
       return { ok: false, error: { message: 'Inicia sesión para usar la inteligencia artificial.', code: 'UNAUTHENTICATED', retryable: false } };
     }
 
-    let response: Response;
-    try {
-      response = await fetch('/api/gemini', {
+    const send = async (token: string) => {
+      const response = await fetch('/api/gemini', {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${idToken}`,
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
         signal,
       });
+      const result = await response.json().catch(() => null) as
+        | { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } }
+        | null;
+      return { response, result };
+    };
+
+    let response: Response;
+    let result: { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } } | null;
+    try {
+      ({ response, result } = await send(idToken));
+      if (response.status === 401) {
+        const refreshed = await getFirebaseIdToken(true);
+        if (refreshed) {
+          idToken = refreshed;
+          ({ response, result } = await send(idToken));
+        }
+      }
     } catch (error) {
       const aborted = error instanceof Error && error.name === 'AbortError';
       return {
@@ -631,20 +714,8 @@ No incluyas texto fuera del JSON.`;
       };
     }
 
-    const result = await response.json().catch(() => null) as
-      | { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown } }
-      | null;
     if (!response.ok || !result || result.ok !== true) {
-      const code = typeof result?.error?.code === 'string' ? result.error.code : 'UNKNOWN_ERROR';
-      const message = typeof result?.error?.message === 'string' ? result.error.message : `Error del servicio de IA (${response.status}).`;
-      const retryable = response.status >= 500 || response.status === 429;
-      const mappedCode = code === 'resource-exhausted' ? 'QUOTA_EXCEEDED'
-        : code === 'unauthenticated' ? 'UNAUTHENTICATED'
-          : code === 'network-error' ? 'NETWORK_ERROR'
-            : code === 'configuration-error' ? 'CONFIG_MISSING'
-              : code === 'invalid-argument' ? 'INVALID_RESPONSE'
-                : code.toUpperCase().replaceAll('-', '_');
-      return { ok: false, error: { message, code: mappedCode, retryable } };
+      return { ok: false, error: this.mapFunctionError(response.status, result) };
     }
     if (typeof result.text !== 'string' || !result.text.trim()) {
       return { ok: false, error: { message: 'El servicio de IA devolvió una respuesta vacía.', code: 'EMPTY_RESPONSE', retryable: true } };
@@ -658,10 +729,10 @@ No incluyas texto fuera del JSON.`;
     state: ScenarioState,
     interviewer: InterviewerProfile,
   ): Promise<ChatMessage> {
-    const prompt = `Genera el mensaje de bienvenida inicial para la simulación "${scenario.title}".
-Presenta la situación inicial de forma inmersiva en segunda persona.
-Termina con una pregunta clara: "¿Qué haces?" o similar.
-No uses formato markdown, solo texto narrativo.`;
+    const prompt = `Inicia la entrevista "${scenario.title}" en primera persona, como ${interviewer.name}.
+Saluda, preséntate con tu cargo y formula una sola pregunta inicial breve y profesional.
+No narres escenas, no describas acciones y no termines con "¿Qué haces?".
+Solo texto plano, diálogo directo.`;
 
     const systemPrompt = this.buildSystemPrompt(
       scenario,
@@ -751,11 +822,11 @@ INSTRUCCIÓN DE INICIO: saluda brevemente usando el nombre ${interviewer.name} y
 ${event.description}
 
 INSTRUCCIONES:
-1. Incorpora este cambio de forma natural en la conversación.
-2. Describe brevemente cómo afecta la situación (1-2 frases).
-3. Formula una nueva pregunta relacionada con el cambio.
-4. No menciones "evento" ni "caos" explícitamente.
-5. Mantén el tono profesional y cercano.`;
+1. Incorpora este cambio como parte natural de la entrevista.
+2. Explica el nuevo matiz en una o dos frases, en primera persona.
+3. Formula una sola pregunta relacionada.
+4. No menciones "evento", "caos" ni mecánicas de juego.
+5. Mantén el tono profesional.`;
   }
 
   private generateChaosEvent(session: SimulationSession): SimulationEvent | null {
@@ -985,8 +1056,8 @@ INSTRUCCIONES:
     }
 
     // Transitorios: sí reintentar
-    if (message.includes('quota') || message.includes('resource_exhausted') || message.includes('429')) {
-      return { message: 'Se alcanzó el límite de uso del servicio de IA. Reintentando…', code: 'QUOTA_EXCEEDED', retryable: true };
+    if (message.includes('quota') || message.includes('resource_exhausted') || message.includes('agotó la cuota') || message.includes('429')) {
+      return { message: 'Se agotó la cuota del servicio de IA. Espera o revisa el uso del proyecto; no reintentaremos automáticamente.', code: 'QUOTA_EXCEEDED', retryable: false };
     }
     if (message.includes('rate limit') || message.includes('too many requests')) {
       return { message: 'Demasiadas solicitudes seguidas. Reintentando…', code: 'RATE_LIMIT_EXCEEDED', retryable: true };

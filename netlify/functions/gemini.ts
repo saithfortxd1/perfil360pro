@@ -74,15 +74,72 @@ function extractText(payload: unknown): string | null {
   return text.trim() || null;
 }
 
+function parseRetryDelaySeconds(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.round(value);
+  if (typeof value !== 'string') return null;
+  const match = /^(\d+(?:\.\d+)?)s$/i.exec(value.trim());
+  if (!match) return null;
+  return Math.round(Number(match[1]));
+}
+
+function classifyProviderFailure(status: number, payload: unknown): {
+  status: number;
+  code: string;
+  message: string;
+  retryAfterSeconds: number | null;
+} {
+  const error = payload && typeof payload === 'object' ? (payload as { error?: unknown }).error : null;
+  const details = error && typeof error === 'object' ? (error as { details?: unknown }).details : null;
+  const providerStatus = error && typeof error === 'object' && typeof (error as { status?: unknown }).status === 'string'
+    ? (error as { status: string }).status
+    : '';
+  const serialized = typeof details === 'object' && details !== null ? JSON.stringify(details).toLowerCase() : '';
+  const dailyQuota = serialized.includes('free_tier') || serialized.includes('perday') || serialized.includes('per_day');
+  let retryAfterSeconds: number | null = null;
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      if (!detail || typeof detail !== 'object') continue;
+      const retryDelay = (detail as { retryDelay?: unknown }).retryDelay;
+      const parsed = parseRetryDelaySeconds(retryDelay);
+      if (parsed !== null) retryAfterSeconds = parsed;
+    }
+  }
+
+  if (status === 429 || providerStatus === 'RESOURCE_EXHAUSTED') {
+    return {
+      status: 429,
+      code: 'resource-exhausted',
+      retryAfterSeconds,
+      message: dailyQuota
+        ? 'Se agotó la cuota diaria del servicio de IA. No reintentes de inmediato; revisa el uso del proyecto o espera al restablecimiento.'
+        : retryAfterSeconds
+          ? `El servicio de IA está saturado. Espera ${retryAfterSeconds} segundos antes de reintentar.`
+          : 'Se alcanzó el límite de uso del servicio de IA. Espera un momento antes de reintentar.',
+    };
+  }
+
+  return {
+    status: status >= 500 ? 502 : 400,
+    code: 'gemini-error',
+    retryAfterSeconds: null,
+    message: 'El servicio de IA rechazó la solicitud.',
+  };
+}
+
 export default async function handler(request: Request, _context: Context): Promise<Response> {
   const origin = request.headers.get('origin');
   if (request.method === 'OPTIONS') return preflightResponse(origin);
   if (request.method !== 'POST') return errorResponse('Método no permitido.', 405, origin);
 
-  const uid = await verifyFirebaseToken(request.headers.get('authorization'));
-  if (!uid) {
-    return errorResponse('Debes iniciar sesión para usar la inteligencia artificial.', 401, origin, 'unauthenticated');
+  const authentication = await verifyFirebaseToken(request.headers.get('authorization'));
+  if (!authentication.ok) {
+    if (authentication.reason === 'configuration-error') {
+      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error');
+    }
+    const safeCode = authentication.code ? `unauthenticated:${authentication.code}` : 'unauthenticated';
+    return errorResponse('Debes iniciar sesión para usar la inteligencia artificial.', 401, origin, safeCode);
   }
+  const uid = authentication.uid;
 
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'PEGA_TU_CLAVE_AQUI') {
@@ -134,7 +191,8 @@ export default async function handler(request: Request, _context: Context): Prom
       usedFallback = true;
       response = await requestModel(apiKey, FALLBACK_MODEL, contents);
     }
-    if (!response.ok && (response.status === 429 || response.status >= 500)) {
+    // Un 429 de cuota no debe disparar otro modelo: consume la misma métrica y empeora el agotamiento.
+    if (!response.ok && response.status >= 500) {
       usedFallback = true;
       response = await requestModel(apiKey, FALLBACK_MODEL, contents);
     }
@@ -144,13 +202,21 @@ export default async function handler(request: Request, _context: Context): Prom
   }
 
   if (!response.ok) {
-    console.error('[gemini] el proveedor respondió', response.status);
-    const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : 400;
-    const code = response.status === 429 ? 'resource-exhausted' : 'gemini-error';
-    const message = response.status === 429
-      ? 'Se alcanzó el límite de uso del servicio de IA.'
-      : 'El servicio de IA rechazó la solicitud.';
-    return errorResponse(message, status, origin, code);
+    const failurePayload = await response.json().catch(() => null);
+    const classified = classifyProviderFailure(response.status, failurePayload);
+    console.error('[gemini] el proveedor respondió', response.status, classified.code);
+    return jsonResponse(
+      {
+        ok: false,
+        error: {
+          message: classified.message,
+          code: classified.code,
+          ...(classified.retryAfterSeconds !== null ? { retryAfterSeconds: classified.retryAfterSeconds } : {}),
+        },
+      },
+      classified.status,
+      origin,
+    );
   }
 
   let result: unknown;

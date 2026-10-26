@@ -26,7 +26,7 @@ import {
   AgentEventsEnum,
   SessionMode,
 } from '@heygen/liveavatar-web-sdk';
-import { requestHeyGenSession, endHeyGenSession } from '@/services/ai/heygenService';
+import { requestHeyGenSession, endHeyGenSession, probeHeyGenFunctions, type HeyGenFunctionsStatus } from '@/services/ai/heygenService';
 import { validateBase64Pcm24k } from '@/services/ai/pcmAudio';
 
 export type HeyGenAvatarState =
@@ -51,6 +51,9 @@ export interface UseHeyGenAvatarReturn {
   error: string | null;
   errorCode: string | null;
   isAvailable: boolean;
+  /** true cuando VITE_HEYGEN_ENABLED se incrustó como 'true' en esta compilación. */
+  configEnabled: boolean;
+  functionsStatus: HeyGenFunctionsStatus;
   /** true cuando el stream de video está realmente listo para mostrarse. */
   isStreamReady: boolean;
   /** El SDK puede silenciar el elemento de vídeo si el navegador bloquea autoplay audible. */
@@ -118,6 +121,7 @@ export function useHeyGenAvatar(options: UseHeyGenAvatarOptions = {}): UseHeyGen
   const [audioCommandStatus, setAudioCommandStatus] = useState<UseHeyGenAvatarReturn['audioCommandStatus']>('idle');
   const [audioCommandError, setAudioCommandError] = useState<string | null>(null);
   const [isAvailable] = useState(() => import.meta.env.VITE_HEYGEN_ENABLED === 'true');
+  const [functionsStatus, setFunctionsStatus] = useState<HeyGenFunctionsStatus>(isAvailable ? 'unknown' : 'unavailable');
   const [connectionPending, setConnectionPending] = useState(false);
 
   const sessionRef = useRef<LiveAvatarSession | null>(null);
@@ -140,6 +144,18 @@ export function useHeyGenAvatar(options: UseHeyGenAvatarOptions = {}): UseHeyGen
 
   speakEndRef.current = onSpeakEnd;
   speakStartRef.current = onSpeakStart;
+
+  useEffect(() => {
+    if (!isAvailable) {
+      setFunctionsStatus('unavailable');
+      return;
+    }
+    const abort = new AbortController();
+    void probeHeyGenFunctions(abort.signal).then((status) => {
+      if (!abort.signal.aborted) setFunctionsStatus(status);
+    });
+    return () => abort.abort();
+  }, [isAvailable]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -427,11 +443,19 @@ export function useHeyGenAvatar(options: UseHeyGenAvatarOptions = {}): UseHeyGen
 
         if (connectAttemptRef.current !== attempt) return;
         if (!result.ok) {
-          setError(result.error.message);
-          setErrorCode(result.error.code);
+          const looksLikeMissingFunction = result.error.code === 'network-error'
+            || result.error.message.includes('Error del servidor');
+          setError(
+            looksLikeMissingFunction
+              ? 'El avatar está habilitado, pero el servicio de sesión no está disponible. Comprueba que las funciones de Netlify estén desplegadas.'
+              : result.error.message,
+          );
+          setErrorCode(looksLikeMissingFunction ? 'functions-unavailable' : result.error.code);
           setState('error');
+          if (looksLikeMissingFunction) setFunctionsStatus('unavailable');
           return;
         }
+        setFunctionsStatus('available');
 
         const { sessionToken, sessionId: sid } = result.value;
         // Modo LITE: nosotros controlamos la conversación; LiveAvatar renderiza el video.
@@ -875,6 +899,8 @@ export function useHeyGenAvatar(options: UseHeyGenAvatarOptions = {}): UseHeyGen
     error,
     errorCode,
     isAvailable,
+    configEnabled: isAvailable,
+    functionsStatus,
     isStreamReady,
     audioPlaybackMuted,
     audioPlaybackError,

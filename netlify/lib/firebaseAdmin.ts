@@ -11,6 +11,10 @@ import { getFirestore, type Firestore } from 'firebase-admin/firestore';
 
 let cachedApp: App | null = null;
 
+export type FirebaseTokenVerification =
+  | { ok: true; uid: string }
+  | { ok: false; reason: 'unauthenticated' | 'configuration-error'; code?: string };
+
 export function getAdminApp(): App {
   if (cachedApp !== null) return cachedApp;
   if (getApps().length > 0) {
@@ -30,6 +34,14 @@ export function getAdminApp(): App {
     throw new Error('FIREBASE_SERVICE_ACCOUNT no es un JSON válido');
   }
 
+  const configuredProjectId = process.env.FIREBASE_PROJECT_ID?.trim() || 'perfil360-8c837';
+  if (
+    typeof serviceAccount.project_id !== 'string' ||
+    serviceAccount.project_id.trim() !== configuredProjectId
+  ) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT no corresponde al FIREBASE_PROJECT_ID configurado');
+  }
+
   // Las claves privadas en variables de entorno suelen traer \n escapados
   if (typeof serviceAccount.private_key === 'string') {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
@@ -37,7 +49,7 @@ export function getAdminApp(): App {
 
   cachedApp = initializeApp({
     credential: cert(serviceAccount as Parameters<typeof cert>[0]),
-    projectId: process.env.FIREBASE_PROJECT_ID || 'perfil360-8c837',
+    projectId: serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID || 'perfil360-8c837',
   });
 
   return cachedApp;
@@ -53,18 +65,32 @@ export function getAdminDb(): Firestore {
 
 /**
  * Verifica el ID token de Firebase enviado en el header Authorization.
- * Devuelve el uid si es válido, o null si no lo es.
+ * Distingue una sesión inválida de un error de configuración del servidor.
  */
-export async function verifyFirebaseToken(authorizationHeader: string | null): Promise<string | null> {
-  if (!authorizationHeader) return null;
+export async function verifyFirebaseToken(
+  authorizationHeader: string | null,
+): Promise<FirebaseTokenVerification> {
+  if (!authorizationHeader) return { ok: false, reason: 'unauthenticated' };
 
   const match = /^Bearer\s+(.+)$/i.exec(authorizationHeader.trim());
-  if (!match) return null;
+  if (!match) return { ok: false, reason: 'unauthenticated' };
+
+  let auth: Auth;
+  try {
+    auth = getAdminAuth();
+  } catch {
+    console.error('[firebase-admin] configuración de autenticación del servidor inválida.');
+    return { ok: false, reason: 'configuration-error' };
+  }
 
   try {
-    const decoded = await getAdminAuth().verifyIdToken(match[1]!);
-    return decoded.uid;
-  } catch {
-    return null;
+    const decoded = await auth.verifyIdToken(match[1]!);
+    return { ok: true, uid: decoded.uid };
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : 'unknown';
+    console.error('[firebase-admin] verificación de ID token fallida:', code);
+    return { ok: false, reason: 'unauthenticated', code };
   }
 }

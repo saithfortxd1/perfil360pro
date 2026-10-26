@@ -239,9 +239,9 @@ function AvatarStage({
   const fallbackReason = (() => {
     if (!heygenEnabled) {
       if (!profile.liveAvatarId) {
-        return `${profile.name} está disponible por voz; este perfil no tiene un ID LiveAvatar asignado.`;
+        return `${profile.name} está disponible por voz; este perfil no tiene un avatar de vídeo asignado.`;
       }
-      return 'Avatar de video desactivado. Se usará la voz del navegador.';
+      return 'El avatar de vídeo no está habilitado en esta versión. Puedes continuar la entrevista con voz o texto.';
     }
     if (heygenState === 'error') {
       return heygenError ?? 'No se pudo conectar con el avatar de video.';
@@ -325,7 +325,7 @@ function AvatarStage({
               </p>
               {!heygenEnabled ? (
                 <p className="max-w-[85%] text-center text-[10px] text-mist-600">
-                  Requiere <code className="text-mist-500">VITE_HEYGEN_ENABLED=true</code> y las funciones desplegadas.
+                  El modo sin vídeo permanece activo. Si necesitas el avatar, habilítalo en la compilación y despliega las funciones de sesión.
                 </p>
               ) : null}
             </div>
@@ -434,7 +434,7 @@ function AvatarStage({
 /* ------------------------------------------------------------------ */
 
 export default function SimuladorInmersivo() {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const reducedMotion = useReducedMotion();
 
   // --- Sesión y Gemini ---
@@ -736,7 +736,7 @@ export default function SimuladorInmersivo() {
 
   // --- Escenarios dinámicos ---
   useEffect(() => {
-    if (!geminiReady) return;
+    if (!geminiReady || authLoading) return;
 
     if (!user) {
       setDynamicScenarios(
@@ -751,6 +751,7 @@ export default function SimuladorInmersivo() {
     }
 
     let cancelled = false;
+    const abort = new AbortController();
 
     const run = async () => {
       setGeneratingScenarios(true);
@@ -771,7 +772,7 @@ export default function SimuladorInmersivo() {
         }
 
         setLastUserProfile(profileResult.value);
-        const result = await geminiService.generateScenariosFromProfile(profileResult.value);
+        const result = await geminiService.generateScenariosFromProfile(profileResult.value, abort.signal);
         if (cancelled) return;
 
         if (result.ok) {
@@ -780,7 +781,7 @@ export default function SimuladorInmersivo() {
           setScenarioGenError(result.error.message);
         }
       } catch (generationError) {
-        if (!cancelled) {
+        if (!cancelled && !(generationError instanceof Error && generationError.name === 'AbortError')) {
           setScenarioGenError(
             generationError instanceof Error ? generationError.message : 'No se pudieron generar los escenarios.',
           );
@@ -793,8 +794,9 @@ export default function SimuladorInmersivo() {
     void run();
     return () => {
       cancelled = true;
+      abort.abort();
     };
-  }, [geminiReady, user]);
+  }, [geminiReady, user, authLoading]);
 
   // --- Conectar avatar cuando hay sesión activa ---
   useEffect(() => {
@@ -961,19 +963,8 @@ export default function SimuladorInmersivo() {
             elapsedMs: Math.round(performance.now() - startedAt),
           });
         }
-        setSession((prev) =>
-          prev
-            ? {
-                ...prev,
-                scenarioState: result.value.scenarioState,
-                messages: [
-                  ...prev.messages,
-                  { id: `user_${Date.now()}`, role: 'user', content, timestamp: Date.now() },
-                  result.value.message,
-                ],
-              }
-            : null,
-        );
+        const current = geminiService.getCurrentSession();
+        setSession(current ? { ...current, messages: [...current.messages] } : null);
       } else {
         setError(result.error.message);
         // Guardamos el texto para que el usuario pueda reintentar sin volver a hablar.
@@ -1046,16 +1037,8 @@ export default function SimuladorInmersivo() {
 
     const result = await geminiService.triggerChaos();
     if (result.ok) {
-      setSession((prev) =>
-        prev
-          ? {
-              ...prev,
-              scenarioState: result.value.scenarioState,
-              messages: [...prev.messages, result.value.response],
-              events: [...prev.events, result.value.event],
-            }
-          : null,
-      );
+      const current = geminiService.getCurrentSession();
+      setSession(current ? { ...current, messages: [...current.messages], events: [...current.events] } : null);
     } else {
       setError(result.error.message);
     }
@@ -1234,6 +1217,20 @@ export default function SimuladorInmersivo() {
   }, [speech.supported.stt, speech.isListening, micError, answerMode, interviewerSpeaking, isSending, ttsBusy, pendingQuestion, requiresLiveAvatar, liveAvatarReady]);
 
   /* ---------------- Estados previos a la entrevista ---------------- */
+
+  if (authLoading) {
+    return (
+      <div className="container mx-auto px-4 py-12 md:px-8 sm:py-24">
+        <PageIntro index="03" kicker="Simulador Inmersivo" title="Comprobando tu sesión…" lead="Espera un momento mientras confirmamos la autenticación." />
+        <div className="flex items-center justify-center py-20">
+          <div className="flex items-center gap-3">
+            <Loader2 className="size-6 animate-spin text-signal-400" aria-hidden="true" />
+            <p className="text-sm text-mist-400">Cargando sesión…</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!user) {
     return (
@@ -1579,8 +1576,14 @@ export default function SimuladorInmersivo() {
                     <span className={cn('size-1.5 shrink-0 rounded-full', heygenAvatar.isAvailable ? 'bg-emerald-400' : 'bg-ink-500')} aria-hidden="true" />
                     <span>
                       Avatar de video:{' '}
-                      <span className={heygenAvatar.isAvailable ? 'text-emerald-300' : 'text-mist-500'}>
-                        {heygenAvatar.isAvailable ? 'activado' : 'desactivado'}
+                      <span className={heygenAvatar.isAvailable && heygenAvatar.functionsStatus !== 'unavailable' ? 'text-emerald-300' : 'text-mist-500'}>
+                        {!heygenAvatar.isAvailable
+                          ? 'desactivado'
+                          : heygenAvatar.functionsStatus === 'unavailable'
+                            ? 'habilitado, servicio no disponible'
+                            : heygenAvatar.functionsStatus === 'unknown'
+                              ? 'habilitado, comprobando servicio'
+                              : 'activado'}
                       </span>
                     </span>
                   </li>
@@ -1612,7 +1615,15 @@ export default function SimuladorInmersivo() {
 
                 {!heygenAvatar.isAvailable ? (
                   <p className="rounded-lg border border-ink-700 bg-ink-800/60 p-4 text-[11px] text-mist-500">
-                    El avatar de video requiere <code className="text-mist-400">VITE_HEYGEN_ENABLED=true</code> y el backend de sesiones desplegado.
+                    El avatar de vídeo está desactivado en esta versión. La entrevista por voz o texto sigue disponible.
+                  </p>
+                ) : heygenAvatar.functionsStatus === 'unavailable' ? (
+                  <p className="rounded-lg border border-ember-500/30 bg-ember-500/5 p-4 text-[11px] text-ember-300">
+                    El avatar está habilitado, pero el servicio de sesión no responde. Comprueba que las funciones de Netlify estén desplegadas.
+                  </p>
+                ) : heygenAvatar.error ? (
+                  <p className="rounded-lg border border-ember-500/30 bg-ember-500/5 p-4 text-[11px] text-ember-300">
+                    {heygenAvatar.error}
                   </p>
                 ) : null}
               </div>
@@ -1693,7 +1704,8 @@ export default function SimuladorInmersivo() {
                 type="button"
                 disabled={heygenAvatar.connectionPending}
                 onClick={() => {
-                  void heygenAvatar.connect(user.uid, profile.liveAvatarId!);
+                  if (!user || !profile.liveAvatarId) return;
+                  void heygenAvatar.connect(user.uid, profile.liveAvatarId);
                 }}
                 className="inline-flex items-center gap-2 rounded-md border border-ember-500/40 bg-ember-500/10 px-3 py-1.5 text-xs font-medium text-ember-300 transition-colors hover:bg-ember-500/20 disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -1854,11 +1866,11 @@ export default function SimuladorInmersivo() {
               )}
             </Panel>
 
-            {/* Modo Caos */}
+            {/* Cambio de contexto de la entrevista */}
             <Panel className="space-y-3">
               <div className="flex items-center justify-between">
-                <MetaLabel>Modo Caos</MetaLabel>
-                <Badge tone={session?.chaosAvailable ? 'accent' : 'neutral'}>{session?.chaosAvailable ? 'Disponible' : 'En enfriamiento'}</Badge>
+                <MetaLabel>Imprevisto laboral</MetaLabel>
+                <Badge tone={session?.chaosAvailable ? 'accent' : 'neutral'}>{session?.chaosAvailable ? 'Disponible' : 'En espera'}</Badge>
               </div>
               <button
                 type="button"

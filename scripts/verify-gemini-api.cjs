@@ -111,7 +111,11 @@ async function main() {
         candidates: [{ content: { parts: [{ text: 'Respuesta local' }] } }],
       }), { status: 200 });
     };
-    stubModule('lib/firebaseAdmin.js', { verifyFirebaseToken: async () => authenticated ? 'user-1' : null });
+    stubModule('lib/firebaseAdmin.js', {
+      verifyFirebaseToken: async () => authenticated
+        ? { ok: true, uid: 'user-1' }
+        : { ok: false, reason: 'unauthenticated' },
+    });
     stubModule('lib/rateLimit.js', {
       checkAndConsumeGeminiRateLimit: async () => ({ ok: allowed, message: 'Límite local' }),
     });
@@ -149,6 +153,34 @@ async function main() {
     allowed = true;
     const invalidResponse = await handler(makeRequest({ contents: [{ role: 'attacker', parts: [{ text: 'Prueba' }] }] }), {});
     check('text function rejects invalid history schema', invalidResponse.status === 400 && textProviderCalls === 1);
+
+    const callsBeforeQuota = textProviderCalls;
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      return new Response(JSON.stringify({
+        error: {
+          code: 429,
+          status: 'RESOURCE_EXHAUSTED',
+          details: [{
+            '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+            violations: [{ quotaMetric: 'generate_content_free_tier_requests' }],
+          }],
+        },
+      }), { status: 429 });
+    };
+    const quotaResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    const quotaBody = await quotaResponse.json();
+    check('text function maps daily quota exhaustion without calling a fallback model',
+      quotaResponse.status === 429 &&
+      quotaBody.error?.code === 'resource-exhausted' &&
+      textProviderCalls === callsBeforeQuota + 1);
+    global.fetch = async (_url, options) => {
+      textProviderCalls += 1;
+      sentBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: 'Respuesta local' }] } }],
+      }), { status: 200 });
+    };
 
     let synthesizedText;
     let synthesizedVoice;

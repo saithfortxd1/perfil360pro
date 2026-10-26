@@ -18,6 +18,8 @@ export interface HeyGenConfig {
   enabled: boolean;
 }
 
+export type HeyGenFunctionsStatus = 'unknown' | 'available' | 'unavailable';
+
 export interface HeyGenSessionData {
   sessionId: string;
   sessionToken: string;
@@ -38,10 +40,31 @@ export function readHeyGenConfig(): HeyGenConfig {
 }
 
 /**
- * HeyGen está disponible si el frontend lo habilita Y hay un backend configurado.
+ * HeyGen está habilitado en esta compilación. Eso no implica que las funciones existan.
  */
 export function isHeyGenAvailable(): boolean {
   return readHeyGenConfig().enabled;
+}
+
+/**
+ * Distingue un frontend con avatar activado de un backend de sesión ausente.
+ * OPTIONS sobre `/api/heygen/session` debe responder 204 si la función está desplegada.
+ * El fallback SPA de Netlify responde 200 HTML.
+ */
+export async function probeHeyGenFunctions(signal?: AbortSignal): Promise<HeyGenFunctionsStatus> {
+  if (!readHeyGenConfig().enabled) return 'unavailable';
+
+  try {
+    const response = await fetch('/api/heygen/session', { method: 'OPTIONS', signal });
+    const allow = response.headers.get('access-control-allow-methods') ?? '';
+    if (response.status === 204 || (response.status === 200 && allow.toUpperCase().includes('POST'))) {
+      return 'available';
+    }
+    return 'unavailable';
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') return 'unknown';
+    return 'unavailable';
+  }
 }
 
 /**
@@ -58,7 +81,7 @@ export async function requestHeyGenSession(
     return {
       ok: false,
       error: {
-        message: 'HeyGen no está habilitado. Define VITE_HEYGEN_ENABLED=true en .env.local',
+        message: 'El avatar de vídeo no está habilitado en esta versión de la aplicación.',
         code: 'HEYGEN_DISABLED',
         retryable: false,
       },
@@ -178,5 +201,5 @@ export async function endHeyGenSession(sessionId: string, sessionToken?: string)
 
 /** Hook de conveniencia (no introduce estado; solo agrupa las funciones). */
 export function useHeyGen() {
-  return { readHeyGenConfig, isHeyGenAvailable, requestHeyGenSession, endHeyGenSession };
+  return { readHeyGenConfig, isHeyGenAvailable, probeHeyGenFunctions, requestHeyGenSession, endHeyGenSession };
 }

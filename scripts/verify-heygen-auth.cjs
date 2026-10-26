@@ -68,7 +68,11 @@ async function main() {
   let tokenCalls = 0;
   let sessionCreationResult = null;
   process.env.HEYGEN_ALLOWED_AVATARS = `${oliviaId},${mateoId}`;
-  stubModule('lib/firebaseAdmin.js', { verifyFirebaseToken: async () => authenticated ? 'test-user' : null });
+  stubModule('lib/firebaseAdmin.js', {
+    verifyFirebaseToken: async () => authenticated
+      ? { ok: true, uid: 'test-user' }
+      : { ok: false, reason: 'unauthenticated' },
+  });
   stubModule('lib/rateLimit.js', {
     checkAndConsumeRateLimit: async () => {
       rateLimitCalls += 1;

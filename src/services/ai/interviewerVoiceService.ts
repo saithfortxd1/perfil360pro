@@ -89,7 +89,7 @@ export async function synthesizeInterviewerSpeech(
         ? payload.error.message
         : `Error del servicio de voz (${response.status}).`;
     const code = payload && 'error' in payload ? payload.error?.code ?? 'server-error' : 'server-error';
-    return { ok: false, error: { message, code, retryable: response.status >= 500 || response.status === 429 } };
+    return { ok: false, error: { message, code, retryable: response.status >= 500 && response.status !== 429 } };
   }
 
   const audioBase64 = payload.audio?.base64;

@@ -27,10 +27,14 @@ export default async function handler(request: Request, _context: Context): Prom
   }
 
   // 1. Autenticación
-  const uid = await verifyFirebaseToken(request.headers.get('authorization'));
-  if (!uid) {
+  const authentication = await verifyFirebaseToken(request.headers.get('authorization'));
+  if (!authentication.ok) {
+    if (authentication.reason === 'configuration-error') {
+      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error');
+    }
     return errorResponse('Debes iniciar sesión para usar el avatar.', 401, origin, 'unauthenticated');
   }
+  const uid = authentication.uid;
 
   // 2. Entrada válida (JSON con avatarId explícito)
   let avatarId: string | undefined;
