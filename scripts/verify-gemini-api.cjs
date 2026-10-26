@@ -174,6 +174,71 @@ async function main() {
       quotaResponse.status === 429 &&
       quotaBody.error?.code === 'resource-exhausted' &&
       textProviderCalls === callsBeforeQuota + 1);
+
+    // Test safe error instrumentation: extracts status, message, reason, domain from ErrorInfo
+    const capturedLogs = [];
+    const originalConsoleError = console.error;
+    console.error = (...args) => {
+      capturedLogs.push(args.join(' '));
+      originalConsoleError(...args);
+    };
+
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      return new Response(JSON.stringify({
+        error: {
+          code: 400,
+          message: 'API key not valid. Please pass a valid API key.',
+          status: 'INVALID_ARGUMENT',
+          details: [{
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: 'API_KEY_INVALID',
+            domain: 'googleapis.com',
+            metadata: { service: 'generativelanguage.googleapis.com' },
+          }],
+        },
+      }), { status: 400 });
+    };
+
+    const errorInfoResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    check('text function handles provider 400 response', errorInfoResponse.status === 400);
+    const loggedErrorLine = capturedLogs.find((log) => log.includes('[gemini] el proveedor respondió 400'));
+    let loggedParsed = null;
+    try {
+      const jsonStart = loggedErrorLine ? loggedErrorLine.indexOf('{') : -1;
+      if (jsonStart !== -1) {
+        loggedParsed = JSON.parse(loggedErrorLine.slice(jsonStart));
+      }
+    } catch {
+      loggedParsed = null;
+    }
+    check('text function logs provider status', loggedParsed?.status === 'INVALID_ARGUMENT');
+    check('text function logs provider sanitized message', loggedParsed?.message?.includes('API key not valid'));
+    check('text function logs provider reason from ErrorInfo', loggedParsed?.reason === 'API_KEY_INVALID');
+    check('text function logs provider domain from ErrorInfo', loggedParsed?.domain === 'googleapis.com');
+
+    // Test safe error instrumentation: non-JSON body response
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      return new Response('<html><body>Bad Gateway</body></html>', { status: 502 });
+    };
+    capturedLogs.length = 0;
+    const htmlResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    check('text function handles provider non-JSON failure', htmlResponse.status === 502);
+    const loggedNonJsonLine = capturedLogs.find((log) => log.includes('[gemini] el proveedor respondió 502'));
+    let loggedNonJsonParsed = null;
+    try {
+      const jsonStart = loggedNonJsonLine ? loggedNonJsonLine.indexOf('{') : -1;
+      if (jsonStart !== -1) {
+        loggedNonJsonParsed = JSON.parse(loggedNonJsonLine.slice(jsonStart));
+      }
+    } catch {
+      loggedNonJsonParsed = null;
+    }
+    check('text function safely flags non-JSON response without leaking raw HTML body', loggedNonJsonParsed?.note === 'no-json-body');
+
+    console.error = originalConsoleError;
+
     global.fetch = async (_url, options) => {
       textProviderCalls += 1;
       sentBody = JSON.parse(options.body);

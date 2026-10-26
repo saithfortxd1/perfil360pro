@@ -202,9 +202,59 @@ export default async function handler(request: Request, _context: Context): Prom
   }
 
   if (!response.ok) {
-    const failurePayload = await response.json().catch(() => null);
+    let failurePayload: unknown = null;
+    let jsonParseFailed = false;
+    try {
+      failurePayload = await response.json();
+    } catch {
+      jsonParseFailed = true;
+    }
+
     const classified = classifyProviderFailure(response.status, failurePayload);
-    console.error('[gemini] el proveedor respondió', response.status, classified.code);
+
+    const errObj = failurePayload && typeof failurePayload === 'object'
+      ? (failurePayload as { error?: unknown }).error
+      : null;
+    const providerStatus = errObj && typeof errObj === 'object' && typeof (errObj as { status?: unknown }).status === 'string'
+      ? (errObj as { status: string }).status.trim()
+      : '';
+    const rawMessage = errObj && typeof errObj === 'object' && typeof (errObj as { message?: unknown }).message === 'string'
+      ? (errObj as { message: string }).message.trim()
+      : '';
+    const sanitizedMessage = rawMessage ? rawMessage.slice(0, 300).replace(/[\r\n\t]+/g, ' ') : '';
+    const details = errObj && typeof errObj === 'object' ? (errObj as { details?: unknown }).details : null;
+    let reason = '';
+    let domain = '';
+    if (Array.isArray(details)) {
+      for (const item of details) {
+        if (!item || typeof item !== 'object') continue;
+        const itemObj = item as Record<string, unknown>;
+        const itemReason = typeof itemObj.reason === 'string' ? itemObj.reason.trim() : '';
+        const itemDomain = typeof itemObj.domain === 'string' ? itemObj.domain.trim() : '';
+
+        if (!reason && itemReason) {
+          reason = itemReason;
+        }
+        if (!domain && itemDomain) {
+          domain = itemDomain;
+        }
+        if (reason && domain) break;
+      }
+    }
+
+    console.error(
+      '[gemini] el proveedor respondió',
+      response.status,
+      classified.code,
+      JSON.stringify({
+        status: providerStatus || undefined,
+        message: sanitizedMessage || undefined,
+        reason: reason || undefined,
+        domain: domain || undefined,
+        ...(jsonParseFailed ? { note: 'no-json-body' } : {}),
+      }),
+    );
+
     return jsonResponse(
       {
         ok: false,
