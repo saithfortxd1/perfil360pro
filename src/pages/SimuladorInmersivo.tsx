@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
 
 import { Button } from '@/components/ui/Button';
@@ -7,7 +7,9 @@ import { Panel } from '@/components/ui/Panel';
 import { Badge } from '@/components/ui/Badge';
 import { MetaLabel } from '@/components/ui/MetaLabel';
 import { PageIntro } from '@/components/layout/PageIntro';
+import { LocalAvatarStage } from '@/components/simulator/LocalAvatarStage';
 import { VoiceSettings } from '@/components/simulator/VoiceSettings';
+import { AUTO_SEND_SILENCE_MS, isNewAutoSubmit, makeAutoSubmitKey } from '@/services/ai/voiceInputPolicy';
 import { geminiService } from '@/services/ai/geminiService';
 import { evaluatePerformance } from '@/services/ai/evaluationService';
 import { saveSimulationHistory } from '@/services/simulationHistory';
@@ -20,7 +22,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useSpeech } from '@/hooks/useSpeech';
 import { useHeyGenAvatar } from '@/hooks/useHeyGenAvatar';
 import { isInterviewerTtsEnabled, synthesizeInterviewerSpeech } from '@/services/ai/interviewerVoiceService';
-import { DEFAULT_INTERVIEWER, getInterviewerById, INTERVIEWER_PROFILES, type InterviewerId, type InterviewerProfile } from '@/services/ai/interviewers';
+import { DEFAULT_INTERVIEWER, getInterviewerById, getAvailableInterviewers, INTERVIEWER_PROFILES, type InterviewerId, type InterviewerProfile } from '@/services/ai/interviewers';
 import { selectInterviewerPlaybackRoute } from '@/services/ai/interviewerPlaybackPolicy';
 import { cn } from '@/lib/utils';
 import {
@@ -39,7 +41,6 @@ import {
   MicOff,
   Volume2,
   VolumeX,
-  Settings2,
   Square,
   Keyboard,
   MessageSquare,
@@ -48,6 +49,14 @@ import {
 } from 'lucide-react';
 
 const SELECTED_INTERVIEWER_STORAGE_KEY = 'perfil360.selectedInterviewer';
+const PREDEFINED_SCENARIO_OPTIONS = Object.values(SCENARIOS).slice(0, 5).map((scenario) => ({
+  id: scenario.id,
+  title: scenario.title,
+  description: scenario.description,
+  difficulty: 'medio',
+  isFallback: true,
+  fallbackReason: 'Escenario predefinido',
+}));
 
 const SESSION_STATUS_COLORS: Record<string, string> = {
   idle: 'neutral',
@@ -91,31 +100,48 @@ function ttsErrorTitle(code: string): string {
   }
 }
 
+function fallbackReasonLabel(reason: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    QUOTA_EXCEEDED: 'cuota de Gemini agotada',
+    UNAUTHENTICATED: 'sesión no autenticada',
+    PERMISSION_DENIED: 'sin permisos de Gemini',
+    SERVICE_UNAVAILABLE: 'servicio de Gemini no disponible',
+    NETWORK_ERROR: 'sin conexión con Gemini',
+    CONFIG_MISSING: 'Gemini sin configurar',
+    SERVER_INTERNAL_ERROR: 'fallo interno de la función Gemini',
+    INVALID_RESPONSE: 'respuesta de Gemini no válida',
+    EMPTY_RESPONSE: 'respuesta de Gemini vacía',
+    LOCAL_FALLBACK_SELECTED: 'continuación local elegida',
+    INTERRUPTED_LOCAL: 'respuesta continuada en modo local tras interrumpir Gemini',
+  };
+  if (!reason) return 'entrevista predefinida';
+  return labels[reason] ?? reason;
+}
+
 /* ------------------------------------------------------------------ */
 /* Selector de escenarios                                              */
 /* ------------------------------------------------------------------ */
 
 interface ScenarioSelectorProps {
-  scenarios: { id: string; title: string; description: string; difficulty: string }[];
+  scenarios: { id: string; title: string; description: string; difficulty: string; isFallback?: boolean; fallbackReason?: string }[];
   onSelect: (id: string) => void;
   loading: boolean;
+  onRetryPersonalization?: () => void;
+  retryingPersonalization?: boolean;
 }
 
-function ScenarioSelector({ scenarios, onSelect, loading }: ScenarioSelectorProps) {
+function ScenarioSelector({ scenarios, onSelect, loading, onRetryPersonalization, retryingPersonalization }: ScenarioSelectorProps) {
   const [open, setOpen] = useState(false);
   const reducedMotion = useReducedMotion();
 
-  if (loading) {
-    return (
-      <div className="flex w-full items-center justify-center gap-3 rounded-md border border-ink-600 bg-ink-800/80 px-4 py-3">
-        <Loader2 className="size-4 animate-spin text-signal-400" aria-hidden="true" />
-        <span className="text-sm text-mist-400">Generando escenarios personalizados…</span>
-      </div>
-    );
-  }
-
   return (
-    <div className="relative">
+    <div className="relative space-y-2">
+      {loading ? (
+        <p className="flex items-center gap-2 rounded-md border border-ink-700 bg-ink-900/60 px-3 py-2 text-xs leading-relaxed text-mist-400" role="status">
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-signal-400" aria-hidden="true" />
+          La personalización de escenarios está en curso. Puedes iniciar ahora con uno predefinido.
+        </p>
+      ) : null}
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
@@ -154,7 +180,14 @@ function ScenarioSelector({ scenarios, onSelect, loading }: ScenarioSelectorProp
                 >
                   <span className="mt-0.5 font-mono text-2xs uppercase text-signal-400">{scenario.difficulty}</span>
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate font-medium text-mist-100">{scenario.title}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="block truncate font-medium text-mist-100">{scenario.title}</span>
+                      {scenario.isFallback ? (
+                        <span className="rounded bg-ink-700 px-1.5 py-0.5 text-[10px] text-mist-400">Predefinido{scenario.fallbackReason && scenario.fallbackReason !== 'Escenario predefinido' ? ` · ${fallbackReasonLabel(scenario.fallbackReason)}` : ''}</span>
+                      ) : (
+                        <span className="rounded bg-signal-500/10 px-1.5 py-0.5 text-[10px] text-signal-300">Personalizado</span>
+                      )}
+                    </span>
                     <span className="mt-0.5 block truncate text-xs text-mist-400">{scenario.description}</span>
                   </span>
                 </button>
@@ -162,6 +195,16 @@ function ScenarioSelector({ scenarios, onSelect, loading }: ScenarioSelectorProp
             </div>
           </motion.div>
         </>
+      ) : null}
+      {scenarios.some((scenario) => scenario.isFallback) && onRetryPersonalization ? (
+        <button
+          type="button"
+          onClick={onRetryPersonalization}
+          disabled={loading || retryingPersonalization}
+          className="w-full rounded-md border border-ink-700 px-3 py-2 text-xs text-mist-400 transition-colors hover:border-signal-400 hover:text-signal-200 disabled:opacity-50"
+        >
+          {retryingPersonalization ? 'Intentando personalización…' : 'Intentar personalizar de nuevo'}
+        </button>
       ) : null}
     </div>
   );
@@ -290,8 +333,9 @@ function AvatarStage({
     <div className="flex w-full min-w-0 flex-col items-center gap-4">
       <div className="relative w-full min-w-0">
         <div
+          style={{ maxWidth: 'min(100%, calc(52dvh * 16 / 9))' }}
           className={cn(
-            'relative aspect-video w-full overflow-hidden rounded-2xl border bg-ink-900 shadow-[0_24px_80px_-44px_rgb(0_0_0/0.9)] transition-colors duration-300',
+            'relative mx-auto aspect-video w-full overflow-hidden rounded-2xl border bg-ink-900 shadow-[0_24px_80px_-44px_rgb(0_0_0/0.9)] transition-colors duration-300',
             interviewerSpeaking ? 'border-amber-300/50' : isListening ? 'border-amber-400/50' : 'border-ink-600',
           )}
         >
@@ -445,16 +489,20 @@ export default function SimuladorInmersivo() {
   const [error, setError] = useState<string | null>(null);
 
   // --- Escenarios ---
-  const [dynamicScenarios, setDynamicScenarios] = useState<{ id: string; title: string; description: string; difficulty: string }[]>([]);
+  const [dynamicScenarios, setDynamicScenarios] = useState<{ id: string; title: string; description: string; difficulty: string; isFallback?: boolean; fallbackReason?: string }[]>(PREDEFINED_SCENARIO_OPTIONS);
   const [generatingScenarios, setGeneratingScenarios] = useState(false);
+  const [retryingPersonalization, setRetryingPersonalization] = useState(false);
   const [scenarioGenError, setScenarioGenError] = useState<string | null>(null);
   const [lastUserProfile, setLastUserProfile] = useState<StoredProfile | null>(null);
   const [pendingScenarioId, setPendingScenarioId] = useState<string | null>(null);
+  const [startingScenario, setStartingScenario] = useState(false);
 
   // --- Entrevista ---
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [chaosLoading, setChaosLoading] = useState(false);
+  const [showVoiceSettings, setShowVoiceSettings] = useState(false);
+  const [completionNotice, setCompletionNotice] = useState<string | null>(null);
   const [evaluating, setEvaluating] = useState(false);
   const [evaluation, setEvaluation] = useState<{ score: number; strengths: string[]; improvements: string[]; summary: string } | null>(null);
   const [selectedAvatar, setSelectedAvatar] = useState<InterviewerId>(() => {
@@ -470,10 +518,10 @@ export default function SimuladorInmersivo() {
   const profile = getInterviewerById(selectedAvatar) ?? DEFAULT_INTERVIEWER;
   const pendingScenario = dynamicScenarios.find((scenario) => scenario.id === pendingScenarioId) ?? null;
 
-  // --- Modo de respuesta ---
+  // --- Modo de respuesta y Avatar ---
+  const [avatarMode, setAvatarMode] = useState<'local' | 'remote'>('local');
   const [answerMode, setAnswerMode] = useState<'voice' | 'text'>('voice');
   const [autoSend, setAutoSend] = useState(true);
-  const [showVoiceSettings, setShowVoiceSettings] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
   const [muted, setMuted] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
@@ -491,8 +539,23 @@ export default function SimuladorInmersivo() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const interviewStageRef = useRef<HTMLElement>(null);
+  const voiceSettingsTriggerRef = useRef<HTMLButtonElement>(null);
+  const voiceSettingsDialogRef = useRef<HTMLDivElement>(null);
+  const voiceSettingsWasOpenRef = useRef(false);
+  const closeVoiceSettingsRef = useRef<() => void>(() => {});
+  const suppressMicRestartRef = useRef(false);
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentRef = useRef<string>('');
+  const inputValueRef = useRef('');
+  const submissionInFlightRef = useRef(false);
+  const submissionOperationIdRef = useRef(0);
+  const startScenarioInFlightRef = useRef(false);
+  const startScenarioOperationIdRef = useRef(0);
+  const retryPersonalizationInFlightRef = useRef(false);
+  const chaosInFlightRef = useRef(false);
+  const chaosOperationIdRef = useRef(0);
+  const evaluationInFlightRef = useRef(false);
+  const lastAutoSubmitKeyRef = useRef<string | null>(null);
   const speechRequestIdRef = useRef(0);
   const speechAbortRef = useRef<AbortController | null>(null);
   const pendingQuestionIdRef = useRef(0);
@@ -513,22 +576,25 @@ export default function SimuladorInmersivo() {
       if (import.meta.env.DEV) {
         console.debug('[latencia] transcripción final recibida');
       }
-      const merged = `${inputValue} ${text}`.replace(/\s+/g, ' ').trim();
+      const merged = `${inputValueRef.current} ${text}`.replace(/\s+/g, ' ').trim();
+      inputValueRef.current = merged;
       setInputValue(merged);
 
-      // Auto-envío tras una pausa breve (solo en modo voz).
-      // 1100 ms: suficiente para una pausa natural al hablar, sin la espera excesiva anterior.
+      // El resultado final del navegador puede aparecer en pausas intermedias; deja una ventana amplia para continuar.
       if (autoSend && answerMode === 'voice') {
         if (autoSendTimerRef.current) clearTimeout(autoSendTimerRef.current);
+        const autoSubmitKey = makeAutoSubmitKey(activeSessionIdRef.current, session?.messages.length ?? 0, merged);
         autoSendTimerRef.current = setTimeout(() => {
           autoSendTimerRef.current = null;
+          if (!isNewAutoSubmit(autoSubmitKey, lastAutoSubmitKeyRef.current)) return;
+          lastAutoSubmitKeyRef.current = autoSubmitKey;
           if (import.meta.env.DEV && voiceFinalizedAtRef.current !== null) {
             console.debug('[latencia] transcripción final → autoenvío:', {
               elapsedMs: Math.round(performance.now() - voiceFinalizedAtRef.current),
             });
           }
           void submitAnswer(merged);
-        }, 1100);
+        }, AUTO_SEND_SILENCE_MS);
       }
     },
     onError: (code) => {
@@ -565,7 +631,7 @@ export default function SimuladorInmersivo() {
       speech.stopListening();
     },
     onSpeakEnd: () => {
-      if (session && answerMode === 'voice' && !muted) {
+      if (session && answerMode === 'voice' && !muted && !suppressMicRestartRef.current) {
         speech.startListening();
       }
     },
@@ -585,8 +651,8 @@ export default function SimuladorInmersivo() {
    * Sin TTS, la pregunta queda sin voz para los perfiles LiveAvatar; no se simula lip-sync con Web Speech.
    */
   const heygenLipSyncAvailable =
-    isInterviewerTtsEnabled() && heygenAvatar.isAvailable && profile.liveAvatarId !== null;
-  const requiresLiveAvatar = heygenAvatar.isAvailable && profile.liveAvatarId !== null;
+    avatarMode === 'remote' && isInterviewerTtsEnabled() && heygenAvatar.isAvailable && profile.liveAvatarId !== null;
+  const requiresLiveAvatar = avatarMode === 'remote' && heygenAvatar.isAvailable && profile.liveAvatarId !== null;
   const liveAvatarReady =
     (heygenAvatar.state === 'connected' || heygenAvatar.state === 'speaking') &&
     heygenAvatar.isStreamReady;
@@ -726,6 +792,13 @@ export default function SimuladorInmersivo() {
     setGeminiError(result.ok ? null : result.error.message);
   }, []);
 
+  // Una ruta restaurada desde una página larga puede conservar el scroll global anterior.
+  // Al entrar al simulador anclamos la cabecera; la conversación solo mueve su transcript.
+  useLayoutEffect(() => {
+    window.scrollTo(0, 0);
+    document.getElementById('contenido-principal')?.scrollTo(0, 0);
+  }, []);
+
   useEffect(() => {
     try {
       window.localStorage.setItem(SELECTED_INTERVIEWER_STORAGE_KEY, selectedAvatar);
@@ -739,14 +812,7 @@ export default function SimuladorInmersivo() {
     if (!geminiReady || authLoading) return;
 
     if (!user) {
-      setDynamicScenarios(
-        Object.values(SCENARIOS).map((scenario) => ({
-          id: scenario.id,
-          title: scenario.title,
-          description: scenario.description,
-          difficulty: 'medio',
-        })),
-      );
+      setDynamicScenarios(PREDEFINED_SCENARIO_OPTIONS);
       return;
     }
 
@@ -756,7 +822,6 @@ export default function SimuladorInmersivo() {
     const run = async () => {
       setGeneratingScenarios(true);
       setScenarioGenError(null);
-      setDynamicScenarios([]);
       setLastUserProfile(null);
 
       try {
@@ -798,14 +863,15 @@ export default function SimuladorInmersivo() {
     };
   }, [geminiReady, user, authLoading]);
 
-  // --- Conectar avatar cuando hay sesión activa ---
+  // --- Conectar avatar cuando hay sesión activa (solo en modo remoto) ---
   useEffect(() => {
+    if (avatarMode !== 'remote') return;
     if (!session || !user || !profile.liveAvatarId) return;
     if (!heygenAvatar.isAvailable) return;
     if (heygenAvatar.state !== 'idle' && heygenAvatar.state !== 'error') return;
     void heygenAvatar.connect(user.uid, profile.liveAvatarId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.id, user?.uid, heygenAvatar.isAvailable, profile.id, profile.liveAvatarId]);
+  }, [session?.id, user?.uid, heygenAvatar.isAvailable, profile.id, profile.liveAvatarId, avatarMode]);
 
   useEffect(() => {
     if (!pendingQuestion) return;
@@ -815,7 +881,7 @@ export default function SimuladorInmersivo() {
     }
     const route = selectInterviewerPlaybackRoute({
       hasActiveSession: Boolean(session),
-      requiresLiveAvatar: heygenAvatar.isAvailable && profile.liveAvatarId !== null,
+      requiresLiveAvatar,
       avatarState: heygenAvatar.state,
       isVideoReady: heygenAvatar.isStreamReady,
       ttsEnabled: heygenLipSyncAvailable,
@@ -868,18 +934,12 @@ export default function SimuladorInmersivo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.messages.length]);
 
-  // --- Auto-scroll ---
+  // Mantén el desplazamiento dentro del transcript abierto; no muevas la página al iniciar.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth' });
-  }, [session?.messages.length, reducedMotion]);
-
-  useEffect(() => {
-    if (!session) return;
-    const stage = interviewStageRef.current;
-    if (!stage) return;
-    stage.focus({ preventScroll: true });
-    stage.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'start' });
-  }, [session?.id, reducedMotion]);
+    const transcript = messagesEndRef.current?.parentElement;
+    if (!transcript || !showTranscript) return;
+    transcript.scrollTo({ top: transcript.scrollHeight, behavior: reducedMotion ? 'auto' : 'smooth' });
+  }, [session?.messages.length, reducedMotion, showTranscript]);
 
   // --- Al terminar de hablar la entrevistadora, activar micrófono (modo voz) ---
   useEffect(() => {
@@ -921,10 +981,29 @@ export default function SimuladorInmersivo() {
 
   /* ---------------- Handlers ---------------- */
 
+  const retryScenarioPersonalization = useCallback(async () => {
+    if (!lastUserProfile || retryPersonalizationInFlightRef.current || startScenarioInFlightRef.current) return;
+    retryPersonalizationInFlightRef.current = true;
+    const startedAt = performance.now();
+    setRetryingPersonalization(true);
+    setScenarioGenError(null);
+    try {
+      const result = await geminiService.generateScenariosFromProfile(lastUserProfile);
+      if (result.ok) setDynamicScenarios(result.value);
+      else setScenarioGenError(result.error.message);
+    } catch (retryError) {
+      setScenarioGenError(retryError instanceof Error ? retryError.message : 'No se pudo personalizar el escenario.');
+    } finally {
+      if (import.meta.env.DEV) console.debug('[latencia] reintento manual de escenarios', { elapsedMs: Math.round(performance.now() - startedAt) });
+      retryPersonalizationInFlightRef.current = false;
+      setRetryingPersonalization(false);
+    }
+  }, [lastUserProfile]);
+
   const submitAnswer = useCallback(
     async (rawContent: string) => {
       const content = rawContent.trim();
-      if (!content || isSending) return;
+      if (!content || isSending || submissionInFlightRef.current) return;
       if (!session) return;
       if (content === lastSentRef.current) {
         // Evita envíos duplicados por eventos de voz repetidos.
@@ -936,8 +1015,12 @@ export default function SimuladorInmersivo() {
         autoSendTimerRef.current = null;
       }
 
+      submissionInFlightRef.current = true;
+      const submissionOperationId = ++submissionOperationIdRef.current;
+      const submittedSessionId = session.id;
       if (interviewerSpeaking || ttsBusy) cancelInterviewerSpeech();
       setInputValue('');
+      inputValueRef.current = '';
       setIsSending(true);
       setError(null);
       setLastFailedAnswer(null);
@@ -955,24 +1038,38 @@ export default function SimuladorInmersivo() {
       speech.stopListening();
 
       const startedAt = performance.now();
-      const result = await geminiService.sendMessage(content);
-
-      if (result.ok) {
+      try {
+        const result = await geminiService.sendMessage(content);
         if (import.meta.env.DEV) {
-          console.debug('[latencia] envío del candidato → texto de respuesta listo:', {
+          console.debug('[latencia] procesamiento de respuesta', {
             elapsedMs: Math.round(performance.now() - startedAt),
+            outcome: result.ok ? (geminiService.isUsingFallback() ? 'local' : 'gemini') : result.error.code,
           });
         }
-        const current = geminiService.getCurrentSession();
-        setSession(current ? { ...current, messages: [...current.messages] } : null);
-      } else {
-        setError(result.error.message);
-        // Guardamos el texto para que el usuario pueda reintentar sin volver a hablar.
+
+        if (activeSessionIdRef.current !== submittedSessionId) return;
+        if (result.ok) {
+          const current = geminiService.getCurrentSession();
+          setSession(current ? { ...current, messages: [...current.messages] } : null);
+        } else if (result.error.code !== 'ABORTED') {
+          setError(result.error.message);
+          setLastFailedAnswer(content);
+          setInputValue(content);
+          inputValueRef.current = content;
+        }
+      } catch (sendError) {
+        if (activeSessionIdRef.current !== submittedSessionId) return;
+        setError(sendError instanceof Error ? sendError.message : 'No se pudo enviar la respuesta.');
         setLastFailedAnswer(content);
         setInputValue(content);
+        inputValueRef.current = content;
+      } finally {
+        if (submissionOperationIdRef.current === submissionOperationId) {
+          submissionInFlightRef.current = false;
+          setIsSending(false);
+          lastSentRef.current = '';
+        }
       }
-      setIsSending(false);
-      lastSentRef.current = '';
     },
     [isSending, session, speech, interviewerSpeaking, ttsBusy, cancelInterviewerSpeech, answerMode],
   );
@@ -1007,97 +1104,230 @@ export default function SimuladorInmersivo() {
   );
 
   const startSelectedScenario = useCallback(async () => {
+    if (startScenarioInFlightRef.current || retryPersonalizationInFlightRef.current) return;
     const scenario = dynamicScenarios.find((entry) => entry.id === pendingScenarioId);
     if (!scenario || !lastUserProfile) return;
 
+    startScenarioInFlightRef.current = true;
+    const startOperationId = ++startScenarioOperationIdRef.current;
+    setCompletionNotice(null);
+    const startedAt = performance.now();
+    setStartingScenario(true);
     setError(null);
     setShowScenarioSelector(false);
+    window.scrollTo(0, 0);
+    document.getElementById('contenido-principal')?.scrollTo(0, 0);
 
     const professionalProfile = {
       role: 'profesional',
       experienceLevel: lastUserProfile.yearsOfExperience > 5 ? 'avanzado' : 'intermedio',
+      fullName: lastUserProfile.fullName,
+      headline: lastUserProfile.headline,
+      bio: lastUserProfile.bio,
+      goal: lastUserProfile.goal,
       skills: lastUserProfile.skills,
       yearsOfExperience: lastUserProfile.yearsOfExperience,
+      education: lastUserProfile.education,
     };
 
-    const result = await geminiService.startDynamicSimulation(scenario, professionalProfile, profile);
-    if (result.ok) {
-      setSession(result.value);
-      setShowTranscript(false);
-    } else {
-      setError(result.error.message);
+    try {
+      const result = await geminiService.startDynamicSimulation(scenario, professionalProfile, profile);
+      if (startScenarioOperationIdRef.current !== startOperationId) return;
+      if (result.ok) {
+        suppressMicRestartRef.current = false;
+        setSession(result.value);
+        setEvaluation(null);
+        setShowTranscript(false);
+        if (import.meta.env.DEV) {
+          console.debug('[latencia] inicio completo', { elapsedMs: Math.round(performance.now() - startedAt), outcome: geminiService.isUsingFallback() ? 'local' : 'gemini' });
+        }
+      } else {
+        setError(result.error.message);
+        setShowScenarioSelector(true);
+      }
+    } catch (startError) {
+      if (startScenarioOperationIdRef.current !== startOperationId) return;
+      setError(startError instanceof Error ? startError.message : 'No se pudo iniciar la entrevista.');
       setShowScenarioSelector(true);
+    } finally {
+      if (startScenarioOperationIdRef.current === startOperationId) {
+        startScenarioInFlightRef.current = false;
+        setStartingScenario(false);
+      }
     }
   }, [dynamicScenarios, lastUserProfile, pendingScenarioId, profile]);
 
   const handleChaos = useCallback(async () => {
-    if (!session || chaosLoading) return;
+    if (!session || chaosLoading || chaosInFlightRef.current || isSending || session.status !== 'active') return;
+    chaosInFlightRef.current = true;
+    const chaosOperationId = ++chaosOperationIdRef.current;
+    const chaosSessionId = session.id;
+    if (autoSendTimerRef.current) {
+      clearTimeout(autoSendTimerRef.current);
+      autoSendTimerRef.current = null;
+    }
+    speech.stopListening();
+    if (pendingQuestion || interviewerSpeaking || ttsBusy) suppressMicRestartRef.current = true;
+    if (pendingQuestion || interviewerSpeaking || ttsBusy) cancelInterviewerSpeech();
     setChaosLoading(true);
     setError(null);
 
-    const result = await geminiService.triggerChaos();
-    if (result.ok) {
+    const startedAt = performance.now();
+    try {
+      const result = await geminiService.triggerChaos();
+      if (activeSessionIdRef.current !== chaosSessionId) return;
+      if (result.ok) {
+        const current = geminiService.getCurrentSession();
+        setSession(current ? { ...current, messages: [...current.messages], events: [...current.events] } : null);
+      } else {
+        const current = geminiService.getCurrentSession();
+        if (current) setSession({ ...current, messages: [...current.messages], events: [...current.events] });
+        if (result.error.code !== 'ABORTED') setError(result.error.message);
+      }
+    } catch (chaosError) {
+      if (activeSessionIdRef.current !== chaosSessionId) return;
       const current = geminiService.getCurrentSession();
-      setSession(current ? { ...current, messages: [...current.messages], events: [...current.events] } : null);
-    } else {
-      setError(result.error.message);
+      if (current) setSession({ ...current, messages: [...current.messages], events: [...current.events] });
+      if (!(chaosError instanceof Error && chaosError.name === 'AbortError')) {
+        setError(chaosError instanceof Error ? chaosError.message : 'No se pudo introducir el imprevisto. La entrevista sigue activa.');
+      }
+    } finally {
+      if (import.meta.env.DEV) {
+        console.debug('[latencia] imprevisto completo', { elapsedMs: Math.round(performance.now() - startedAt), outcome: geminiService.isUsingFallback() ? 'local' : 'gemini' });
+      }
+      if (chaosOperationIdRef.current === chaosOperationId) {
+        chaosInFlightRef.current = false;
+        setChaosLoading(false);
+        suppressMicRestartRef.current = false;
+      }
     }
-    setChaosLoading(false);
-  }, [session, chaosLoading]);
+  }, [session, chaosLoading, isSending, pendingQuestion, interviewerSpeaking, ttsBusy, speech, cancelInterviewerSpeech]);
+
+  const handleInterrupt = useCallback(() => {
+    if (isSending) {
+      speech.stopListening();
+      if (autoSendTimerRef.current) {
+        clearTimeout(autoSendTimerRef.current);
+        autoSendTimerRef.current = null;
+      }
+      if (geminiService.interruptCurrentTurnLocally()) return;
+    }
+    speech.stopListening();
+    cancelInterviewerSpeech();
+  }, [isSending, speech, cancelInterviewerSpeech]);
+
+  const openVoiceSettings = useCallback(() => {
+    suppressMicRestartRef.current = true;
+    speech.stopListening();
+    cancelInterviewerSpeech();
+    speech.refreshVoices();
+    setShowVoiceSettings(true);
+  }, [speech, cancelInterviewerSpeech]);
+
+  const closeVoiceSettings = useCallback(() => {
+    speech.stopSpeaking();
+    setShowVoiceSettings(false);
+    suppressMicRestartRef.current = false;
+    if (session && answerMode === 'voice' && !muted) speech.startListening();
+  }, [speech, session, answerMode, muted]);
+  closeVoiceSettingsRef.current = closeVoiceSettings;
+
+  useEffect(() => {
+    if (!showVoiceSettings) {
+      if (voiceSettingsWasOpenRef.current && activeSessionIdRef.current) voiceSettingsTriggerRef.current?.focus({ preventScroll: true });
+      voiceSettingsWasOpenRef.current = false;
+      return;
+    }
+    voiceSettingsWasOpenRef.current = true;
+    voiceSettingsDialogRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeVoiceSettingsRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showVoiceSettings]);
 
   const handleEvaluate = useCallback(async () => {
-    if (!session || !user) return;
+    if (!session || !user || evaluationInFlightRef.current) return;
+    const evaluatedSessionId = session.id;
+    evaluationInFlightRef.current = true;
     setEvaluating(true);
-    const result = await evaluatePerformance({
-      userId: user.uid,
-      scenarioId: session.scenarioId,
-      messages: session.messages,
-      scenarioState: { progress: session.scenarioState.progress, resources: session.scenarioState.resources },
-    });
-    if (result.ok) {
-      const evaluated = {
-        score: result.value.score,
-        strengths: result.value.strengths,
-        improvements: result.value.improvements,
-        summary: result.value.summary,
-      };
-      setEvaluation(evaluated);
-      try {
-        saveSimulationHistory(user.uid, {
-          id: session.id,
-          title: session.scenarioState.title,
-          completedAt: Date.now(),
-          ...evaluated,
-        });
-      } catch (historyError) {
-        console.error('[Simulador] No se pudo guardar el historial local:', historyError instanceof Error ? historyError.message : 'unknown');
-        setError('La evaluación se completó, pero no se pudo guardar en el historial local.');
+    try {
+      const result = await evaluatePerformance({
+        userId: user.uid,
+        scenarioId: session.scenarioId,
+        messages: session.messages,
+        scenarioState: { progress: session.scenarioState.progress, resources: session.scenarioState.resources },
+      });
+      if (result.ok) {
+        const evaluated = {
+          score: result.value.score,
+          strengths: result.value.strengths,
+          improvements: result.value.improvements,
+          summary: result.value.summary,
+        };
+        try {
+          saveSimulationHistory(user.uid, {
+            id: session.id,
+            title: session.scenarioState.title,
+            completedAt: Date.now(),
+            ...evaluated,
+          });
+        } catch (historyError) {
+          console.error('[Simulador] No se pudo guardar el historial local:', historyError instanceof Error ? historyError.message : 'unknown');
+          if (activeSessionIdRef.current === evaluatedSessionId) setError('La evaluación se completó, pero no se pudo guardar en el historial local.');
+        }
+        if (activeSessionIdRef.current === evaluatedSessionId) setEvaluation(evaluated);
+      } else {
+        if (activeSessionIdRef.current === evaluatedSessionId) setError(result.error.message);
       }
-    } else {
-      setError(result.error.message);
+    } catch (evaluationError) {
+      if (activeSessionIdRef.current === evaluatedSessionId) setError(evaluationError instanceof Error ? evaluationError.message : 'No se pudo completar la evaluación.');
+    } finally {
+      evaluationInFlightRef.current = false;
+      setEvaluating(false);
     }
-    setEvaluating(false);
   }, [session, user]);
 
   const handleEndInterview = useCallback(async () => {
+    const wasEvaluating = evaluationInFlightRef.current;
+    activeSessionIdRef.current = null;
+    submissionOperationIdRef.current += 1;
+    submissionInFlightRef.current = false;
+    chaosInFlightRef.current = false;
+    chaosOperationIdRef.current += 1;
+    startScenarioInFlightRef.current = false;
+    startScenarioOperationIdRef.current += 1;
+    setIsSending(false);
+    setChaosLoading(false);
+    setStartingScenario(false);
     if (autoSendTimerRef.current) {
       clearTimeout(autoSendTimerRef.current);
       autoSendTimerRef.current = null;
     }
     // Cancela cualquier petición en vuelo para que no actualice estado tras salir.
     geminiService.abortCurrentTurn();
+    geminiService.endSimulation();
     speech.stopListening();
     cancelInterviewerSpeech();
     startedPendingQuestionRef.current = null;
-    await heygenAvatar.stop();
-    geminiService.endSimulation();
     setSession(null);
     setEvaluation(null);
     setShowScenarioSelector(true);
+    setShowVoiceSettings(false);
+    setCompletionNotice(wasEvaluating
+      ? 'Entrevista terminada. La evaluación que ya estaba en curso finalizará en segundo plano.'
+      : evaluation
+        ? 'Entrevista terminada. La evaluación ya está disponible para esta práctica.'
+        : 'Entrevista terminada. No se inició una evaluación al cerrar; puedes comenzar otra práctica.');
     setError(null);
     setLastFailedAnswer(null);
     setInputValue('');
-  }, [speech, heygenAvatar, cancelInterviewerSpeech]);
+    inputValueRef.current = '';
+    lastSentRef.current = '';
+    suppressMicRestartRef.current = true;
+    void heygenAvatar.stop();
+  }, [speech, heygenAvatar, cancelInterviewerSpeech, evaluation]);
 
   const toggleMic = useCallback(() => {
     setMicError(null);
@@ -1140,7 +1370,7 @@ export default function SimuladorInmersivo() {
     return lastModel?.content ?? '';
   }, [session]);
 
-  const userMessageCount = session ? session.messages.filter((message) => message.role === 'user').length : 0;
+  const userMessageCount = session ? session.messages.filter((message) => message.role === 'user' && !message.metadata?.isCandidateName).length : 0;
 
   /** Estado de voz derivado, siempre visible para el usuario. */
   const voiceStatus = useMemo(() => {
@@ -1241,6 +1471,7 @@ export default function SimuladorInmersivo() {
           title="Acceso restringido"
           lead="Inicia sesión y completa tu perfil para que Gemini genere tus entrevistas personalizadas."
         />
+
         <div className="flex items-center justify-center py-20">
           <Panel className="max-w-lg border-ember-500/30 bg-ember-500/5 text-center">
             <div className="flex flex-col items-center gap-4">
@@ -1298,6 +1529,14 @@ export default function SimuladorInmersivo() {
           lead="Elige un escenario, escucha las preguntas y responde por voz. Gemini conduce la entrevista y evalúa tu desempeño al final."
         />
 
+        {completionNotice ? (
+          <div className="mt-6" role="status" aria-live="polite">
+            <Panel className="border-signal-500/30 bg-signal-500/[0.04] p-4">
+              <p className="text-sm text-mist-200">{completionNotice}</p>
+            </Panel>
+          </div>
+        ) : null}
+
         <div className="mt-10 grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
           {/* Selección */}
           <div className="space-y-6">
@@ -1315,9 +1554,9 @@ export default function SimuladorInmersivo() {
 
             <Panel className="space-y-6 p-5 sm:p-6" ticks>
               <div>
-                <MetaLabel index="01">Entrevistadora</MetaLabel>
+                <MetaLabel index="01">Entrevistador</MetaLabel>
                 <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {INTERVIEWER_PROFILES.map((entry) => (
+                  {getAvailableInterviewers().map((entry) => (
                     <article
                       key={entry.id}
                       className={cn(
@@ -1373,7 +1612,7 @@ export default function SimuladorInmersivo() {
                             disabled={selectedAvatar !== entry.id || !speech.supported.tts || speech.isSpeaking || !speech.selectedVoice}
                             onClick={() => speech.previewVoice(
                               undefined,
-                              `Hola, soy ${entry.name}, ${entry.gender === 'mujer' ? 'tu entrevistadora' : entry.gender === 'hombre' ? 'tu entrevistador' : 'la persona que conducirá la entrevista'}. ¿Podemos comenzar la entrevista?`,
+                              `Hola, soy ${entry.name}, tu entrevistador. ¿Podemos comenzar la entrevista?`,
                             )}
                             className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-ink-600 px-2.5 text-[10px] font-medium text-mist-200 transition-colors hover:border-signal-400 hover:text-mist-50 disabled:cursor-not-allowed disabled:opacity-45 sm:min-h-8"
                             aria-label={`Probar muestra local de voz de ${entry.name}`}
@@ -1397,7 +1636,13 @@ export default function SimuladorInmersivo() {
               <div>
                 <MetaLabel index="02">Escenario</MetaLabel>
                 <div className="mt-3">
-                  <ScenarioSelector scenarios={dynamicScenarios} onSelect={handleScenarioSelect} loading={generatingScenarios} />
+                  <ScenarioSelector
+                    scenarios={dynamicScenarios}
+                    onSelect={handleScenarioSelect}
+                    loading={generatingScenarios}
+                    onRetryPersonalization={retryScenarioPersonalization}
+                    retryingPersonalization={retryingPersonalization}
+                  />
                 </div>
                 {scenarioGenError ? (
                   <div role="alert" className="mt-3 rounded-md border border-ember-500/40 bg-ember-500/10 p-3">
@@ -1446,6 +1691,40 @@ export default function SimuladorInmersivo() {
               </div>
             </Panel>
 
+            {avatarMode === 'local' ? (
+              <details
+                className="group rounded-lg border border-ink-700/70 bg-ink-900/50 px-4 py-3"
+                onToggle={(event) => { if (event.currentTarget.open) speech.refreshVoices(); }}
+              >
+                <summary className="cursor-pointer list-none text-xs font-medium text-mist-300 marker:hidden">
+                  Configuración opcional de voz
+                  <span className="ml-2 text-mist-500">· {speech.selectedVoice?.name ?? 'sin voz española detectada'}</span>
+                </summary>
+                <div className="pt-3">
+                  <VoiceSettings
+                    voices={speech.voices}
+                    voicesLoading={speech.voicesLoading}
+                    excludedSystemVoices={speech.excludedSystemVoices}
+                    includeSystemVoices={speech.includeSystemVoices}
+                    onToggleSystemVoices={speech.setIncludeSystemVoices}
+                    selectedVoiceURI={speech.selectedVoiceURI ?? speech.selectedVoice?.voice.voiceURI ?? null}
+                    rate={speech.rate}
+                    voicesNotice={speech.voicesNotice}
+                    browserTtsAvailable={speech.supported.tts}
+                    heygenEnabled={false}
+                    isPreviewing={speech.isSpeaking}
+                    onSelectVoice={speech.selectVoice}
+                    onPreviewVoice={(voiceURI) => speech.previewVoice(voiceURI)}
+                    onStopPreview={speech.stopSpeaking}
+                    onRateChange={speech.setRate}
+                  />
+                  <p className="mt-2 text-[10px] text-mist-500">
+                    El navegador no declara el género de sus voces. Solo indicamos una probable cuando el proveedor lo señala explícitamente en los metadatos; puedes escuchar cada muestra antes de elegir.
+                  </p>
+                </div>
+              </details>
+            ) : null}
+
             <Panel className="space-y-4 border-signal-500/30 bg-signal-500/[0.04] p-5 sm:p-6" ticks>
               <div>
                 <MetaLabel index="03">Preparación</MetaLabel>
@@ -1469,61 +1748,78 @@ export default function SimuladorInmersivo() {
                   </p>
                 )}
               </div>
-              <Button
+      <Button
                 size="lg"
                 className="w-full"
-                disabled={!pendingScenario || generatingScenarios || !lastUserProfile}
+        disabled={!pendingScenario || retryingPersonalization || startingScenario || !lastUserProfile}
                 onClick={() => void startSelectedScenario()}
               >
-                <span>Iniciar entrevista</span>
+        {startingScenario ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+        <span>{startingScenario ? 'Iniciando…' : 'Iniciar entrevista'}</span>
                 <ArrowRight className="size-4" aria-hidden="true" />
               </Button>
               <p className="text-center text-[11px] text-mist-500">
                 La entrevista comienza aquí. La vista previa remota del avatar es opcional y requiere una acción explícita.
               </p>
             </Panel>
-
-            {!heygenAvatar.isAvailable || !profile.liveAvatarId ? (
-              <VoiceSettings
-                voices={speech.voices}
-                excludedSystemVoices={speech.excludedSystemVoices}
-                includeSystemVoices={speech.includeSystemVoices}
-                onToggleSystemVoices={speech.setIncludeSystemVoices}
-                selectedVoiceURI={speech.selectedVoice?.voice.voiceURI ?? null}
-                rate={speech.rate}
-                voicesNotice={speech.voicesNotice}
-                heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
-                isPreviewing={speech.isSpeaking}
-                onSelectVoice={speech.selectVoice}
-                onPreviewVoice={speech.previewVoice}
-                onRateChange={speech.setRate}
-              />
-            ) : null}
           </div>
 
           {/* Vista previa del avatar y estado del simulador */}
           <div>
             <Panel className="flex flex-col gap-4 p-3 sm:gap-6 sm:p-6" ticks>
-              <AvatarStage
-                videoRef={heygenAvatar.videoRef}
-                heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
-                isInterviewActive={false}
-                heygenState={heygenAvatar.state}
-                isStreamReady={heygenAvatar.isStreamReady}
-                profile={profile}
-                interviewerSpeaking={heygenAvatar.state === 'speaking'}
-                isListening={false}
-                heygenError={heygenAvatar.error}
-                audioPlaybackMuted={heygenAvatar.audioPlaybackMuted}
-                audioPlaybackError={heygenAvatar.audioPlaybackError}
-                onEnableAudioPlayback={() => {
-                  void heygenAvatar.enableAudioPlayback();
-                }}
-                audioCommandStatus={heygenAvatar.audioCommandStatus}
-                audioCommandError={heygenAvatar.audioCommandError}
-                onRetryQuestion={() => {}}
-                lipSyncAvailable={heygenLipSyncAvailable}
-              />
+              {/* Modo de presentación del avatar: Local (por defecto) o HeyGen (remoto) */}
+              {avatarMode === 'local' ? (
+                <LocalAvatarStage
+                  profile={profile}
+                  voiceName={speech.selectedVoice?.name ?? null}
+                  voiceRate={speech.rate}
+                  isInterviewActive={false}
+                  isSpeaking={speech.isSpeaking}
+                  isListening={false}
+                  avatarMode={avatarMode}
+                  onSwitchMode={(mode) => setAvatarMode(mode)}
+                />
+              ) : (
+                <AvatarStage
+                  videoRef={heygenAvatar.videoRef}
+                  heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
+                  isInterviewActive={false}
+                  heygenState={heygenAvatar.state}
+                  isStreamReady={heygenAvatar.isStreamReady}
+                  profile={profile}
+                  interviewerSpeaking={heygenAvatar.state === 'speaking'}
+                  isListening={false}
+                  heygenError={heygenAvatar.error}
+                  audioPlaybackMuted={heygenAvatar.audioPlaybackMuted}
+                  audioPlaybackError={heygenAvatar.audioPlaybackError}
+                  onEnableAudioPlayback={() => {
+                    void heygenAvatar.enableAudioPlayback();
+                  }}
+                  audioCommandStatus={heygenAvatar.audioCommandStatus}
+                  audioCommandError={heygenAvatar.audioCommandError}
+                  onRetryQuestion={() => {}}
+                  lipSyncAvailable={heygenLipSyncAvailable}
+                />
+              )}
+              {profile.liveAvatarId && (
+                <div className="flex items-center justify-between rounded-lg border border-ink-700/60 bg-ink-900/40 p-2.5 text-xs">
+                  <div className="flex flex-col">
+                    <span className="font-medium text-mist-200">Modo de Entrevistador</span>
+                    <span className="text-[11px] text-mist-400">
+                      {avatarMode === 'local'
+                        ? 'Modo Local activo: voz y simulación sin créditos externos.'
+                        : 'Modo Remoto (HeyGen): utiliza créditos de sesión.'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAvatarMode((mode) => (mode === 'local' ? 'remote' : 'local'))}
+                    className="rounded border border-ink-600 bg-ink-800 px-2.5 py-1 text-[11px] font-medium text-mist-200 hover:border-signal-400 hover:text-white"
+                  >
+                    Cambiar a {avatarMode === 'local' ? 'Modo Remoto' : 'Modo Local'}
+                  </button>
+                </div>
+              )}
               {heygenAvatar.isAvailable && profile.liveAvatarId ? (
                 <div className="w-full space-y-3 border-t border-ink-700/60 pt-5">
                   <div className="space-y-1">
@@ -1637,7 +1933,7 @@ export default function SimuladorInmersivo() {
   /* ---------------- Entrevista en curso ---------------- */
 
   return (
-    <div className="flex min-h-dvh flex-col bg-ink-950">
+    <div className="flex h-full min-h-0 flex-col bg-ink-950">
       {/* Header */}
       <header className="sticky top-0 z-30 border-b border-ink-700/80 bg-ink-950/90 backdrop-blur-md">
         <div className="container mx-auto flex h-14 items-center justify-between gap-4 px-4 md:px-8">
@@ -1648,6 +1944,11 @@ export default function SimuladorInmersivo() {
             <div className="min-w-0">
               <p className="font-mono text-2xs uppercase text-red-400">Entrevista en vivo</p>
               <h1 className="truncate text-sm font-semibold text-mist-100">{session?.scenarioState.title ?? 'Entrevista'}</h1>
+              {geminiService.isUsingFallback() ? (
+                <p className="truncate text-[10px] text-amber-300" role="status">
+                  Modo local · {fallbackReasonLabel(geminiService.getFallbackReason())}
+                </p>
+              ) : null}
             </div>
           </div>
 
@@ -1655,6 +1956,31 @@ export default function SimuladorInmersivo() {
             <Badge tone={(SESSION_STATUS_COLORS[session?.status ?? 'idle'] ?? 'neutral') as never} className="hidden sm:inline-flex">
               {session?.status ?? 'idle'}
             </Badge>
+            <button
+              ref={voiceSettingsTriggerRef}
+              type="button"
+              onClick={openVoiceSettings}
+              aria-haspopup="dialog"
+              aria-expanded={showVoiceSettings}
+              aria-label="Configurar voz"
+              className="flex items-center gap-1.5 rounded-md border border-ink-600 bg-ink-800/80 px-3 py-1.5 text-xs font-medium text-mist-200 transition-colors hover:border-signal-400 hover:text-signal-200"
+            >
+              <Volume2 className="size-3.5" aria-hidden="true" />
+              <span className="sm:hidden">Voz</span>
+              <span className="hidden sm:inline">Configurar voz</span>
+            </button>
+            {interviewerSpeaking || ttsBusy || pendingQuestion || isSending ? (
+              <button
+                type="button"
+                onClick={handleInterrupt}
+                className="flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/20"
+                aria-label={isSending ? 'Interrumpir respuesta de Gemini y continuar localmente' : 'Interrumpir reproducción del entrevistador'}
+              >
+                <Square className="size-3.5" aria-hidden="true" />
+                <span className="sm:hidden">Parar</span>
+                <span className="hidden sm:inline">Interrumpir</span>
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={handleEndInterview}
@@ -1667,7 +1993,55 @@ export default function SimuladorInmersivo() {
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto">
+      {showVoiceSettings ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-3 backdrop-blur-sm sm:p-6">
+          <div
+            ref={voiceSettingsDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="active-voice-settings-title"
+            tabIndex={-1}
+            className="relative max-h-[90dvh] w-full max-w-2xl overflow-y-auto overscroll-contain rounded-xl border border-ink-600 bg-ink-950 p-4 shadow-2xl sm:p-6"
+          >
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <h2 id="active-voice-settings-title" className="text-base font-semibold text-mist-100">Configurar voz</h2>
+                <p className="mt-1 text-xs text-mist-400">La selección se guarda para {profile.name} y se usa en la voz del navegador.</p>
+              </div>
+              <button type="button" onClick={closeVoiceSettings} aria-label="Cerrar configuración de voz" className="rounded-md p-2 text-mist-400 hover:bg-ink-800 hover:text-white">
+                <X className="size-4" aria-hidden="true" />
+              </button>
+            </div>
+            {avatarMode === 'remote' && heygenLipSyncAvailable ? (
+              <p className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-200">
+                LiveAvatar usa la voz TTS configurada en el servidor. Esta selección se aplica cuando se reproduce con la voz del navegador.
+              </p>
+            ) : null}
+            <VoiceSettings
+              voices={speech.voices}
+              voicesLoading={speech.voicesLoading}
+              excludedSystemVoices={speech.excludedSystemVoices}
+              includeSystemVoices={speech.includeSystemVoices}
+              onToggleSystemVoices={speech.setIncludeSystemVoices}
+              selectedVoiceURI={speech.selectedVoiceURI ?? speech.selectedVoice?.voice.voiceURI ?? null}
+              rate={speech.rate}
+              voicesNotice={speech.voicesNotice}
+              browserTtsAvailable={speech.supported.tts}
+              heygenEnabled={avatarMode === 'remote' && heygenLipSyncAvailable}
+              isPreviewing={speech.isSpeaking}
+              onSelectVoice={speech.selectVoice}
+              onPreviewVoice={(voiceURI) => speech.previewVoice(voiceURI)}
+              onStopPreview={speech.stopSpeaking}
+              onRateChange={speech.setRate}
+            />
+            <div className="mt-4 flex justify-end">
+              <button type="button" onClick={closeVoiceSettings} className="rounded-md border border-ink-600 px-4 py-2 text-sm font-medium text-mist-200 hover:border-signal-400 hover:text-white">Listo</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <div className="mx-auto flex min-h-full w-full max-w-[96rem] flex-col gap-6 px-4 py-6 md:px-8 lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(18rem,22rem)] xl:grid-cols-[minmax(0,1fr)_minmax(20rem,24rem)]">
           {/* Escenario del avatar */}
           <section
@@ -1676,29 +2050,67 @@ export default function SimuladorInmersivo() {
             aria-label="Escenario de entrevista"
             className="flex min-w-0 flex-1 flex-col items-center justify-start gap-6 outline-none"
           >
-            <AvatarStage
-              videoRef={heygenAvatar.videoRef}
-              heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
-              isInterviewActive={Boolean(session)}
-              heygenState={heygenAvatar.state}
-              isStreamReady={heygenAvatar.isStreamReady}
-              profile={profile}
-              interviewerSpeaking={interviewerSpeaking}
-              isListening={speech.isListening}
-              heygenError={heygenAvatar.error}
-              audioPlaybackMuted={heygenAvatar.audioPlaybackMuted}
-              audioPlaybackError={heygenAvatar.audioPlaybackError}
-              onEnableAudioPlayback={() => {
-                void heygenAvatar.enableAudioPlayback();
-              }}
-              audioCommandStatus={heygenAvatar.audioCommandStatus}
-              audioCommandError={heygenAvatar.audioCommandError}
-              onRetryQuestion={repeatQuestion}
-              lipSyncAvailable={heygenLipSyncAvailable}
-            />
+            {startingScenario && !session ? (
+              <div className="w-full max-w-2xl" aria-live="polite" role="status">
+                <Panel className="flex items-center gap-3 border-signal-500/30 bg-signal-500/5 p-4 sm:p-5">
+                  <Loader2 className="size-4 shrink-0 animate-spin text-signal-300" aria-hidden="true" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-mist-100">Preparando la primera pregunta</p>
+                    <p className="mt-1 text-xs leading-relaxed text-mist-400">
+                      {pendingScenario?.isFallback
+                        ? 'El escenario predefinido está listo; la entrevista continuará en modo local.'
+                        : 'Gemini está preparando la bienvenida. Si el servicio falla, continuaremos con una bienvenida local.'}
+                    </p>
+                    {!pendingScenario?.isFallback ? (
+                      <button
+                        type="button"
+                        onClick={() => geminiService.continueWithLocalFallback()}
+                        className="mt-3 rounded-md border border-ink-600 bg-ink-800 px-3 py-2 text-xs font-medium text-mist-200 transition-colors hover:border-signal-400 hover:text-white"
+                      >
+                        Continuar en modo local
+                      </button>
+                    ) : null}
+                  </div>
+                </Panel>
+              </div>
+            ) : null}
 
-            {/* Recuperación del avatar sin perder la conversación textual */}
-            {heygenAvatar.isAvailable && profile.liveAvatarId && session &&
+            {avatarMode === 'local' ? (
+              <LocalAvatarStage
+                profile={profile}
+                voiceName={speech.selectedVoice?.name ?? null}
+                voiceRate={speech.rate}
+                isInterviewActive={Boolean(session)}
+                isSpeaking={speech.isSpeaking}
+                isListening={speech.isListening}
+                avatarMode={avatarMode}
+                onSwitchMode={(mode) => setAvatarMode(mode)}
+              />
+            ) : (
+              <AvatarStage
+                videoRef={heygenAvatar.videoRef}
+                heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
+                isInterviewActive={Boolean(session)}
+                heygenState={heygenAvatar.state}
+                isStreamReady={heygenAvatar.isStreamReady}
+                profile={profile}
+                interviewerSpeaking={interviewerSpeaking}
+                isListening={speech.isListening}
+                heygenError={heygenAvatar.error}
+                audioPlaybackMuted={heygenAvatar.audioPlaybackMuted}
+                audioPlaybackError={heygenAvatar.audioPlaybackError}
+                onEnableAudioPlayback={() => {
+                  void heygenAvatar.enableAudioPlayback();
+                }}
+                audioCommandStatus={heygenAvatar.audioCommandStatus}
+                audioCommandError={heygenAvatar.audioCommandError}
+                onRetryQuestion={repeatQuestion}
+                lipSyncAvailable={heygenLipSyncAvailable}
+              />
+            )}
+
+            {/* Recuperación del avatar remoto solo cuando el usuario está en modo remoto */}
+            {avatarMode === 'remote' && heygenAvatar.isAvailable && profile.liveAvatarId && session &&
             (heygenAvatar.state === 'error' || heygenAvatar.state === 'idle') ? (
               <button
                 type="button"
@@ -1716,8 +2128,8 @@ export default function SimuladorInmersivo() {
                   {heygenAvatar.connectionPending
                     ? 'Esperando que termine el intento anterior'
                     : heygenAvatar.state === 'error'
-                      ? 'Reintentar conexión del avatar'
-                      : 'Iniciar conexión del avatar'}
+                      ? 'Reintentar conexión del avatar remoto'
+                      : 'Iniciar conexión del avatar remoto'}
                 </span>
               </button>
             ) : null}
@@ -1757,7 +2169,7 @@ export default function SimuladorInmersivo() {
             </AnimatePresence>
           </section>
 
-          {/* Panel lateral: transcripción y ajustes */}
+          {/* Panel lateral: transcripción */}
           <aside className="flex min-w-0 w-full flex-col gap-4">
             <div className="flex items-center gap-2">
               <button
@@ -1772,40 +2184,11 @@ export default function SimuladorInmersivo() {
                 <MessageSquare className="size-3.5" aria-hidden="true" />
                 <span>Transcripción ({userMessageCount})</span>
               </button>
-              <button
-                type="button"
-                onClick={() => setShowVoiceSettings((value) => !value)}
-                className={cn(
-                  'inline-flex min-h-9 items-center justify-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors',
-                  showVoiceSettings ? 'border-signal-400/60 bg-signal-500/10 text-signal-200' : 'border-ink-600 text-mist-300 hover:border-ink-500',
-                )}
-                aria-expanded={showVoiceSettings}
-                aria-label="Configuración de voz"
-              >
-                <Settings2 className="size-3.5" aria-hidden="true" />
-              </button>
             </div>
 
-            {showVoiceSettings ? (
-              <VoiceSettings
-                voices={speech.voices}
-                excludedSystemVoices={speech.excludedSystemVoices}
-                includeSystemVoices={speech.includeSystemVoices}
-                onToggleSystemVoices={speech.setIncludeSystemVoices}
-                selectedVoiceURI={speech.selectedVoice?.voice.voiceURI ?? null}
-                rate={speech.rate}
-                voicesNotice={speech.voicesNotice}
-                heygenEnabled={heygenAvatar.isAvailable && profile.liveAvatarId !== null}
-                isPreviewing={speech.isSpeaking}
-                onSelectVoice={speech.selectVoice}
-                onPreviewVoice={speech.previewVoice}
-                onRateChange={speech.setRate}
-              />
-            ) : null}
-
             {showTranscript ? (
-              <Panel className="flex min-h-0 flex-1 flex-col">
-                <div className="flex-1 space-y-3 overflow-y-auto" role="log" aria-live="polite" aria-label="Transcripción de la entrevista">
+              <Panel className="flex min-h-0 max-h-[55dvh] flex-1 flex-col p-3 sm:p-4 lg:max-h-[calc(100dvh-13rem)]">
+                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain" role="log" aria-live="polite" aria-label="Transcripción de la entrevista">
                   {session?.messages.map((message) => <MessageBubble key={message.id} message={message} interviewerName={profile.name} />)}
                   <div ref={messagesEndRef} />
                 </div>
@@ -1813,27 +2196,30 @@ export default function SimuladorInmersivo() {
             ) : null}
 
             {/* Evaluación */}
-            <Panel className="space-y-3">
-              <div className="flex items-center justify-between">
-                <MetaLabel index="04">Evaluación</MetaLabel>
+            <Panel className="space-y-4 p-4 sm:p-5">
+              <div className="flex items-center justify-between gap-3 border-b border-ink-700/70 pb-2">
+                <MetaLabel index="04" className="tracking-[0.1em]">Evaluación</MetaLabel>
                 {evaluation ? (
-                  <Badge tone={evaluation.score >= 70 ? 'done' : evaluation.score >= 40 ? 'neutral' : 'pending'}>{evaluation.score}/100</Badge>
+                  <div className="flex items-center gap-2">
+                    {evaluation.summary.toLowerCase().includes('evaluación local') ? <Badge tone="neutral">Evaluación local</Badge> : null}
+                    <Badge tone={evaluation.score >= 70 ? 'done' : evaluation.score >= 40 ? 'neutral' : 'pending'}>{evaluation.score}/100</Badge>
+                  </div>
                 ) : null}
               </div>
               <button
                 type="button"
                 onClick={handleEvaluate}
                 disabled={evaluating || userMessageCount === 0}
-                className="flex w-full items-center justify-center gap-2 rounded-md bg-gradient-to-r from-signal-500 to-ion-400 px-4 py-2.5 text-sm font-semibold text-ink-950 transition-all hover:from-signal-400 hover:to-ion-300 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex min-h-11 w-full items-center justify-center gap-2 rounded-md bg-gradient-to-r from-signal-500 to-ion-400 px-4 py-2.5 text-sm font-semibold text-ink-950 transition-all hover:from-signal-400 hover:to-ion-300 disabled:cursor-not-allowed disabled:from-ink-700 disabled:to-ink-700 disabled:text-mist-300 disabled:opacity-100"
               >
                 {evaluating ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Sparkles className="size-4" aria-hidden="true" />}
                 <span>{evaluating ? 'Evaluando…' : 'Evaluar desempeño'}</span>
               </button>
               {evaluation ? (
-                <div className="space-y-2 text-xs">
+                <div className="space-y-3 text-xs leading-relaxed">
                   {evaluation.strengths.length > 0 ? (
                     <div>
-                      <p className="font-mono text-[10px] uppercase text-mist-500">Fortalezas</p>
+                        <p className="font-mono text-[10px] uppercase tracking-[0.08em] text-mist-500">Fortalezas</p>
                       <ul className="mt-1 space-y-1">
                         {evaluation.strengths.map((item, index) => (
                           <li key={`s-${index}`} className="flex min-w-0 gap-1.5 text-mist-300">
@@ -1846,7 +2232,7 @@ export default function SimuladorInmersivo() {
                   ) : null}
                   {evaluation.improvements.length > 0 ? (
                     <div>
-                      <p className="font-mono text-[10px] uppercase text-mist-500">Áreas de mejora</p>
+                        <p className="font-mono text-[10px] uppercase tracking-[0.08em] text-mist-500">Áreas de mejora</p>
                       <ul className="mt-1 space-y-1">
                         {evaluation.improvements.map((item, index) => (
                           <li key={`i-${index}`} className="flex min-w-0 gap-1.5 text-mist-300">
@@ -1857,7 +2243,7 @@ export default function SimuladorInmersivo() {
                       </ul>
                     </div>
                   ) : null}
-                  {evaluation.summary ? <p className="italic text-mist-400">{evaluation.summary}</p> : null}
+                  {evaluation.summary ? <p className="rounded-md border border-ink-700/80 bg-ink-900/60 p-3 leading-relaxed text-mist-400">{evaluation.summary}</p> : null}
                 </div>
               ) : (
                 <p className="text-xs text-mist-500">
@@ -1867,16 +2253,17 @@ export default function SimuladorInmersivo() {
             </Panel>
 
             {/* Cambio de contexto de la entrevista */}
-            <Panel className="space-y-3">
-              <div className="flex items-center justify-between">
-                <MetaLabel>Imprevisto laboral</MetaLabel>
-                <Badge tone={session?.chaosAvailable ? 'accent' : 'neutral'}>{session?.chaosAvailable ? 'Disponible' : 'En espera'}</Badge>
+            <Panel className="space-y-4 p-4 sm:p-5">
+              <div className="flex items-center justify-between gap-3 border-b border-ink-700/70 pb-2">
+                <MetaLabel className="tracking-[0.1em]">Imprevisto laboral</MetaLabel>
+                <Badge className="shrink-0" tone={session?.chaosAvailable ? 'accent' : 'neutral'}>{session?.chaosAvailable ? 'Disponible' : 'En espera'}</Badge>
               </div>
               <button
                 type="button"
                 onClick={handleChaos}
-                disabled={!session?.chaosAvailable || chaosLoading || session?.status !== 'active'}
-                className="flex w-full items-center justify-center gap-2 rounded-md border border-ember-500/40 bg-ember-500/10 px-4 py-2 text-sm font-medium text-ember-300 transition-colors hover:bg-ember-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!session?.chaosAvailable || chaosLoading || isSending || session?.status !== 'active'}
+                title={speech.isListening || interviewerSpeaking || ttsBusy ? 'Se detendrá el micrófono o la reproducción para introducir el imprevisto' : undefined}
+                className="flex min-h-11 w-full items-center justify-center gap-2 rounded-md border border-ember-500/40 bg-ember-500/10 px-4 py-2.5 text-sm font-medium text-ember-300 transition-colors hover:bg-ember-500/20 disabled:cursor-not-allowed disabled:border-ink-600 disabled:bg-ink-800 disabled:text-mist-400 disabled:opacity-100"
               >
                 {chaosLoading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Zap className="size-4" aria-hidden="true" />}
                 <span>{chaosLoading ? 'Preparando…' : 'Introducir imprevisto'}</span>
@@ -1998,7 +2385,7 @@ export default function SimuladorInmersivo() {
             <div className="relative min-w-0 flex-1">
               <textarea
                 value={speech.interimTranscript ? `${inputValue} ${speech.interimTranscript}`.trim() : inputValue}
-                onChange={(event) => setInputValue(event.target.value)}
+                onChange={(event) => { inputValueRef.current = event.target.value; setInputValue(event.target.value); }}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();

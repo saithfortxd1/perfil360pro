@@ -92,11 +92,12 @@ try {
     simulator.includes('TTS deshabilitado por configuración.') &&
     simulator.includes('Reintentar voz') &&
     simulator.includes('onClick={repeatQuestion}'));
-  check('a new interview moves focus and scrolls to the scenario rather than the transcript end',
-    simulator.includes('interviewStageRef.current') &&
-    simulator.includes('stage.focus({ preventScroll: true })') &&
-    simulator.includes('stage.scrollIntoView') &&
-    simulator.includes('}, [session?.id, reducedMotion]);'));
+  check('simulator entry and start anchor at the header while transcript scroll stays inside its panel',
+    simulator.includes('transcript.scrollTo({ top: transcript.scrollHeight') &&
+    simulator.includes('window.scrollTo(0, 0)') &&
+    !/window\.scrollTo\([^)]*(?:scrollHeight|messagesEndRef)/.test(simulator) &&
+    !simulator.includes('stage.scrollIntoView') &&
+    !simulator.includes('messagesEndRef.current?.scrollIntoView'));
   check('UI exposes waiting state and no-voice-before-ready message',
     simulator.includes('Esperando que el vídeo esté listo') &&
     simulator.includes('La pregunta está lista. Se reproducirá cuando el vídeo y la sesión del avatar estén preparados.'));
@@ -113,10 +114,25 @@ try {
     simulator.includes('p-3 sm:gap-6 sm:p-6') &&
     simulator.includes('min-h-11') &&
     simulator.includes('env(safe-area-inset-bottom)'));
+  check('active interview bounds the transcript and keeps lower panels padded on desktop and mobile',
+    simulator.includes('max-h-[55dvh]') &&
+    simulator.includes('lg:max-h-[calc(100dvh-13rem)]') &&
+    simulator.includes('space-y-4 p-4 sm:p-5') &&
+    simulator.includes('tracking-[0.1em]') &&
+    simulator.includes('disabled:text-mist-300 disabled:opacity-100'));
+  const appShell = fs.readFileSync(path.join(root, 'src/components/layout/AppShell.tsx'), 'utf8');
+  check('active simulator uses the space below the global header and does not append the long site footer',
+    appShell.includes("isSimulator ? 'flex h-dvh min-h-0 flex-col'") &&
+    appShell.includes("isSimulator ? 'min-h-0 flex-1 overflow-y-auto") &&
+    appShell.includes('!isDashboard && !isSimulator ? <SiteFooter /> : null'));
   check('development latency diagnostics measure transcript, text, TTS, and SDK handoff without logging content',
     simulator.includes('[latencia] transcripción final recibida') &&
     simulator.includes('transcriptToSubmitMs') &&
-    simulator.includes('envío del candidato → texto de respuesta listo') &&
+    simulator.includes('[latencia] respuesta del candidato aceptada') &&
+    simulator.includes('[latencia] procesamiento de respuesta') &&
+    simulator.includes('[latencia] inicio completo') &&
+    simulator.includes('[latencia] imprevisto completo') &&
+    simulator.includes('[latencia] evaluación final') &&
     simulator.includes('síntesis TTS terminada') &&
     simulator.includes('errorCode: result.ok ? null : result.error.code') &&
     simulator.includes('envío local de audio a LiveAvatar SDK') &&

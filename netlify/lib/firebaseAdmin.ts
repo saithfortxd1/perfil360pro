@@ -107,10 +107,10 @@ export async function verifyFirebaseToken(
   let auth: Auth;
   try {
     auth = getAdminAuth();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[firebase-admin] configuración de autenticación del servidor inválida: ${message}`);
-    return { ok: false, reason: 'configuration-error', code: message };
+  } catch {
+    // Configuration details can contain project identifiers; keep diagnostics categorical.
+    console.error('[firebase-admin] configuración de autenticación inválida (CONFIGURATION_ERROR)');
+    return { ok: false, reason: 'configuration-error', code: 'firebase-admin-configuration' };
   }
 
   try {

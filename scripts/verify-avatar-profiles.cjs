@@ -38,9 +38,9 @@ try {
   const james = profiles.getInterviewerById('james');
   const olivia = profiles.getInterviewerById('olivia');
   const mateo = profiles.getInterviewerById('mateo');
-  check('James has the user-confirmed LiveAvatar ID without an assumed voice gender',
+  check('James has the user-confirmed LiveAvatar ID and masculine interviewer identity',
     james?.liveAvatarId === '69a246bd-1739-418d-b533-9fc578208175' &&
-    james.gender === 'no especificado' &&
+    james.gender === 'hombre' &&
     james.voice.provider === 'gemini-tts');
   check('Olivia has her configured LiveAvatar ID and feminine conversational identity',
     olivia?.liveAvatarId === 'dc6a2ade-fcad-48b4-89ce-8ae807b18c32' && olivia.gender === 'mujer');
@@ -130,8 +130,8 @@ try {
     ttsFunction.includes("'Puck'"));
   check('browser fallback voice preference is stored separately for each interviewer',
     simulator.includes('voicePreferenceKey: `perfil360.voice.uri.${profile.id}`') &&
-    speechHook.includes('localStorage.getItem(voicePreferenceKey)') &&
-    speechHook.includes('localStorage.setItem(voicePreferenceKey, voiceURI)'));
+    speechHook.includes('readVoicePreference(localStorage, voicePreferenceKey)') &&
+    speechHook.includes('writeVoicePreference(localStorage, voicePreferenceKey, voiceURI)'));
   check('SDK session stop is primary and Netlify end is only a fallback',
     hook.includes('await session.stop()') &&
     hook.includes('if (sessionId && !closedBySdk)') &&

@@ -1,0 +1,9 @@
+# Probar el simulador localmente
+
+- `npm run dev:vite` sirve únicamente la interfaz con Vite (normalmente en `http://localhost:5173`). No monta `netlify/functions`, así que `/api/gemini` no está disponible. El simulador debe continuar con escenarios y entrevista locales cuando esa ruta falle.
+- `npm run dev` es el comando recomendado para la prueba integrada. `netlify dev` sirve la aplicación en `http://localhost:8888`, inicia Vite en el puerto interno 5173 y expone las funciones de `netlify/functions` bajo `/api/*`.
+- Para probar una respuesta real de Gemini, configura las variables de entorno locales que exige la función (`GEMINI_API_KEY`, autenticación de Firebase y variables de Firebase del cliente), inicia `npm run dev` y prueba solo cuando la cuota esté disponible. No uses la llamada real para verificar el fallback: `npm run verify:local-interview` simula HTTP 429 y no contacta a Gemini.
+
+La alerta de Vite `server connection lost. Polling for restart...` significa que el navegador perdió la conexión WebSocket de desarrollo y Vite está buscando que el servidor vuelva a aparecer. Por sí sola no distingue entre un proceso terminado, reiniciado o una conexión interrumpida. En esta revisión no había un proceso escuchando en los puertos 5173 o 8888. El intento de comprobar `npm run dev` después terminó antes de iniciar Vite porque Netlify CLI no pudo abrir su archivo de configuración de actualización de usuario (EPERM); no se inició un segundo servidor. Si vuelve a ocurrir, comprueba primero la salida de la misma terminal que ejecutó el servidor y que el proceso siga escuchando en el puerto esperado.
+
+`ERR_BLOCKED_BY_CLIENT` suele señalar que una extensión o protección del navegador bloqueó una solicitud. No es la causa del 429 de `/api/gemini`; confirma la URL y el estado de la solicitud en Network y compara con un perfil del navegador sin bloqueadores si Firestore deja de cargar.

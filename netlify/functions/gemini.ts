@@ -12,7 +12,6 @@ const MAX_BODY_BYTES = 512_000;
 const MAX_CONTENT_ITEMS = 101;
 const MAX_TOTAL_TEXT_LENGTH = 100_000;
 const PRIMARY_MODEL = process.env.GEMINI_TEXT_MODEL?.trim() || 'gemini-3.5-flash';
-const FALLBACK_MODEL = process.env.GEMINI_TEXT_FALLBACK_MODEL?.trim() || 'gemini-3.5-flash-lite';
 const API_BASE = (process.env.GEMINI_API_BASE_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
 
 function parseContents(payload: unknown): GeminiContent[] | null {
@@ -42,7 +41,41 @@ function parseContents(payload: unknown): GeminiContent[] | null {
   return contents;
 }
 
+const SCENARIO_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    scenarios: {
+      type: 'ARRAY',
+      description: 'Lista de escenarios de entrevista personalizados.',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          id: { type: 'STRING', description: 'Identificador único del escenario' },
+          title: { type: 'STRING', description: 'Título del escenario' },
+          description: { type: 'STRING', description: 'Descripción detallada de la entrevista' },
+          difficulty: { type: 'STRING', enum: ['facil', 'medio', 'dificil'], description: 'Nivel de dificultad' },
+        },
+        required: ['id', 'title', 'description', 'difficulty'],
+      },
+    },
+  },
+  required: ['scenarios'],
+};
+
+function detectScenarioRequest(contents: GeminiContent[]): boolean {
+  return contents.some((c) =>
+    c.parts.some((p) => {
+      const lower = p.text.toLowerCase();
+      return (
+        lower.includes('escenarios de entrevista') ||
+        (lower.includes('"scenarios"') && lower.includes('"difficulty"'))
+      );
+    }),
+  );
+}
+
 async function requestModel(apiKey: string, model: string, contents: GeminiContent[]): Promise<Response> {
+  const isScenario = detectScenarioRequest(contents);
   return fetch(`${API_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: 'POST',
     headers: {
@@ -55,10 +88,19 @@ async function requestModel(apiKey: string, model: string, contents: GeminiConte
         temperature: 0.55,
         topP: 0.9,
         topK: 40,
-        maxOutputTokens: 420,
+        maxOutputTokens: isScenario ? 1600 : 800,
+        ...(isScenario ? { responseMimeType: 'application/json', responseSchema: SCENARIO_SCHEMA } : {}),
       },
     }),
   });
+}
+
+function extractFinishReason(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const candidates = (payload as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const first = candidates[0] as { finishReason?: unknown } | undefined;
+  return typeof first?.finishReason === 'string' ? first.finishReason : null;
 }
 
 function extractText(payload: unknown): string | null {
@@ -87,6 +129,8 @@ function classifyProviderFailure(status: number, payload: unknown): {
   code: string;
   message: string;
   retryAfterSeconds: number | null;
+  category: 'RATE_LIMIT_ERROR' | 'PROVIDER_ERROR';
+  sourceStatus: number;
 } {
   const error = payload && typeof payload === 'object' ? (payload as { error?: unknown }).error : null;
   const details = error && typeof error === 'object' ? (error as { details?: unknown }).details : null;
@@ -110,6 +154,8 @@ function classifyProviderFailure(status: number, payload: unknown): {
       status: 429,
       code: 'resource-exhausted',
       retryAfterSeconds,
+      category: 'RATE_LIMIT_ERROR',
+      sourceStatus: status,
       message: dailyQuota
         ? 'Se agotó la cuota diaria del servicio de IA. No reintentes de inmediato; revisa el uso del proyecto o espera al restablecimiento.'
         : retryAfterSeconds
@@ -119,11 +165,25 @@ function classifyProviderFailure(status: number, payload: unknown): {
   }
 
   return {
-    status: status >= 500 ? 502 : 400,
-    code: 'gemini-error',
+    // Keep provider 401/403 distinct from Firebase auth. Returning 502 also
+    // prevents the browser from refreshing its Firebase token for an upstream error.
+    status: 502,
+    code: 'provider-error',
     retryAfterSeconds: null,
+    category: 'PROVIDER_ERROR',
+    sourceStatus: status,
     message: 'El servicio de IA rechazó la solicitud.',
   };
+}
+
+function createOperationId(request: Request): string {
+  const requestedId = request.headers.get('x-operation-id')?.trim();
+  if (requestedId && /^[a-zA-Z0-9_-]{8,80}$/.test(requestedId)) return requestedId;
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
 }
 
 export default async function handler(request: Request, _context: Context): Promise<Response> {
@@ -134,16 +194,23 @@ export default async function handler(request: Request, _context: Context): Prom
   const authentication = await verifyFirebaseToken(request.headers.get('authorization'));
   if (!authentication.ok) {
     if (authentication.reason === 'configuration-error') {
-      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error');
+      return errorResponse('La autenticación Firebase del servidor no está configurada correctamente.', 500, origin, 'configuration-error', {
+        category: 'CONFIGURATION_ERROR',
+      });
     }
     const safeCode = authentication.code ? `unauthenticated:${authentication.code}` : 'unauthenticated';
-    return errorResponse('Debes iniciar sesión para usar la inteligencia artificial.', 401, origin, safeCode);
+    return errorResponse('Debes iniciar sesión para usar la inteligencia artificial.', 401, origin, safeCode, {
+      category: 'AUTHENTICATION_ERROR',
+      sourceCode: authentication.code,
+    });
   }
   const uid = authentication.uid;
 
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'PEGA_TU_CLAVE_AQUI') {
-    return errorResponse('El servicio de IA no está configurado en el servidor.', 500, origin, 'configuration-error');
+    return errorResponse('El servicio de IA no está configurado en el servidor.', 500, origin, 'configuration-error', {
+      category: 'CONFIGURATION_ERROR',
+    });
   }
 
   const contentLength = Number(request.headers.get('content-length') ?? 0);
@@ -172,33 +239,68 @@ export default async function handler(request: Request, _context: Context): Prom
     return errorResponse(`La solicitud debe contener texto válido (máximo ${MAX_TOTAL_TEXT_LENGTH} caracteres).`, 400, origin, 'invalid-argument');
   }
 
+  const operationId = createOperationId(request);
+  const operationType = detectScenarioRequest(contents) ? 'scenarios' : 'generate_content';
+  const operationStartedAt = performance.now();
+
   try {
     const rateLimit = await checkAndConsumeGeminiRateLimit(uid);
     if (!rateLimit.ok) {
-      return errorResponse(rateLimit.message ?? 'Límite de uso alcanzado.', 429, origin, 'resource-exhausted');
+      console.warn('[gemini] operación', JSON.stringify({
+        operationId,
+        operationType,
+        durationMs: Math.round(performance.now() - operationStartedAt),
+        outcome: 'error',
+        category: 'RATE_LIMIT_ERROR',
+        httpStatus: 429,
+        engine: 'gemini',
+      }));
+      return errorResponse(rateLimit.message ?? 'Límite de uso alcanzado.', 429, origin, 'resource-exhausted', {
+        category: 'RATE_LIMIT_ERROR',
+      });
     }
   } catch (error) {
-    console.error('[gemini] error de rate limit:', error instanceof Error ? error.message : 'unknown');
-    return errorResponse('No se pudo verificar el límite de uso.', 500, origin, 'internal');
+    console.error('[gemini] operación', JSON.stringify({
+      operationId,
+      operationType,
+      durationMs: Math.round(performance.now() - operationStartedAt),
+      outcome: 'error',
+      category: 'PERSISTENCE_ERROR',
+      engine: 'gemini',
+    }));
+    return errorResponse('No se pudo verificar el límite de uso.', 500, origin, 'rate-limit-unavailable', {
+      category: 'PERSISTENCE_ERROR',
+      sourceCode: 'firestore-rate-limit',
+    });
   }
 
   let response: Response;
   let usedFallback = false;
+  const providerStartedAt = performance.now();
   try {
-    try {
-      response = await requestModel(apiKey, PRIMARY_MODEL, contents);
-    } catch {
-      usedFallback = true;
-      response = await requestModel(apiKey, FALLBACK_MODEL, contents);
-    }
-    // Un 429 de cuota no debe disparar otro modelo: consume la misma métrica y empeora el agotamiento.
-    if (!response.ok && response.status >= 500) {
-      usedFallback = true;
-      response = await requestModel(apiKey, FALLBACK_MODEL, contents);
-    }
+    // Una operación hace una sola solicitud al proveedor. Ante cuota, red o 5xx,
+    // el cliente puede activar su diálogo local sin esperar un segundo modelo.
+    response = await requestModel(apiKey, PRIMARY_MODEL, contents);
   } catch (error) {
-    console.error('[gemini] fallo de red:', error instanceof Error ? error.message : 'unknown');
-    return errorResponse('No se pudo contactar con el servicio de IA.', 502, origin, 'network-error');
+    const isTimeout = error instanceof Error && error.name === 'TimeoutError';
+    const category = isTimeout ? 'TIMEOUT_ERROR' : 'NETWORK_ERROR';
+    const code = isTimeout ? 'timeout-error' : 'network-error';
+    console.error('[gemini] operación', JSON.stringify({
+      operationId,
+      operationType,
+      durationMs: Math.round(performance.now() - operationStartedAt),
+      providerDurationMs: Math.round(performance.now() - providerStartedAt),
+      outcome: 'error',
+      category,
+      engine: 'gemini',
+    }));
+    return errorResponse(
+      isTimeout ? 'El servicio de IA tardó demasiado en responder.' : 'No se pudo contactar con el servicio de IA.',
+      502,
+      origin,
+      code,
+      { category },
+    );
   }
 
   if (!response.ok) {
@@ -218,10 +320,6 @@ export default async function handler(request: Request, _context: Context): Prom
     const providerStatus = errObj && typeof errObj === 'object' && typeof (errObj as { status?: unknown }).status === 'string'
       ? (errObj as { status: string }).status.trim()
       : '';
-    const rawMessage = errObj && typeof errObj === 'object' && typeof (errObj as { message?: unknown }).message === 'string'
-      ? (errObj as { message: string }).message.trim()
-      : '';
-    const sanitizedMessage = rawMessage ? rawMessage.slice(0, 300).replace(/[\r\n\t]+/g, ' ') : '';
     const details = errObj && typeof errObj === 'object' ? (errObj as { details?: unknown }).details : null;
     let reason = '';
     let domain = '';
@@ -243,12 +341,18 @@ export default async function handler(request: Request, _context: Context): Prom
     }
 
     console.error(
-      '[gemini] el proveedor respondió',
-      response.status,
-      classified.code,
+      '[gemini] operación',
       JSON.stringify({
-        status: providerStatus || undefined,
-        message: sanitizedMessage || undefined,
+        operationId,
+        operationType,
+        durationMs: Math.round(performance.now() - operationStartedAt),
+        providerDurationMs: Math.round(performance.now() - providerStartedAt),
+        outcome: 'error',
+        category: classified.category,
+        httpStatus: classified.status,
+        sourceStatus: classified.sourceStatus,
+        sourceCode: classified.code,
+        providerStatus: providerStatus || undefined,
         reason: reason || undefined,
         domain: domain || undefined,
         ...(jsonParseFailed ? { note: 'no-json-body' } : {}),
@@ -261,6 +365,9 @@ export default async function handler(request: Request, _context: Context): Prom
         error: {
           message: classified.message,
           code: classified.code,
+          category: classified.category,
+          sourceCode: classified.code,
+          sourceStatus: classified.sourceStatus,
           ...(classified.retryAfterSeconds !== null ? { retryAfterSeconds: classified.retryAfterSeconds } : {}),
         },
       },
@@ -273,12 +380,33 @@ export default async function handler(request: Request, _context: Context): Prom
   try {
     result = await response.json();
   } catch {
-    return errorResponse('Respuesta ilegible del servicio de IA.', 502, origin, 'invalid-response');
+    return errorResponse('Respuesta ilegible del servicio de IA.', 502, origin, 'invalid-response', {
+      category: 'INVALID_RESPONSE',
+      sourceStatus: response.status,
+    });
   }
-  const text = extractText(result);
-  if (!text) return errorResponse('El servicio de IA no devolvió texto.', 502, origin, 'empty-response');
 
-  return jsonResponse({ ok: true, text, usedFallback }, 200, origin);
+  const finishReason = extractFinishReason(result);
+  if (finishReason === 'MAX_TOKENS') {
+    console.warn('[gemini] La respuesta fue truncada por límite de tokens (finishReason=MAX_TOKENS).');
+  }
+
+  const text = extractText(result);
+  if (!text) return errorResponse('El servicio de IA no devolvió texto.', 502, origin, 'empty-response', {
+    category: 'INVALID_RESPONSE',
+    sourceStatus: response.status,
+  });
+
+  console.info('[gemini] operación', JSON.stringify({
+    operationId,
+    operationType,
+    durationMs: Math.round(performance.now() - operationStartedAt),
+    providerDurationMs: Math.round(performance.now() - providerStartedAt),
+    outcome: 'success',
+    engine: 'gemini',
+  }));
+
+  return jsonResponse({ ok: true, text, usedFallback, ...(finishReason ? { finishReason } : {}) }, 200, origin);
 }
 
 export const config: Config = {

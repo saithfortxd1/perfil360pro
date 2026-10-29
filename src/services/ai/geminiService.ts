@@ -5,10 +5,12 @@ import type {
   ScenarioConfig,
   SimulationSession,
   GeminiConfig,
+  AIServiceFailure,
 } from '@/types/ai';
 import { DEFAULT_GEMINI_CONFIG } from '@/types/ai';
 import { getFirebaseIdToken } from '@/services/firebase/idToken';
 import { DEFAULT_INTERVIEWER, type InterviewerProfile } from '@/services/ai/interviewers';
+import { SCENARIOS } from '@/services/ai/scenarios';
 
 /**
  * Plantilla de evento inesperado del Modo Caos.
@@ -28,12 +30,18 @@ interface GeminiContent {
   parts: { text: string }[];
 }
 
+import { parseScenariosResponse } from '@/services/ai/scenarioParser';
+import { generateLocalWelcomeMessage, generateLocalCandidateNameTurn, generateLocalChaosTurn, generateLocalFollowUpTurn } from '@/services/ai/localInterviewFallback';
+import { classifyTransportError, normalizeGeminiFunctionError } from '@/services/ai/errorClassification';
+export { parseScenariosResponse };
+
 const PRIMARY_MODEL = 'gemini-3.5-flash';
+type AiOperationType = 'scenarios' | 'welcome' | 'turn' | 'chaos' | 'evaluation' | 'content';
 
 /**
  * Servicio centralizado de Inteligencia Artificial con Gemini
  * Maneja conversaciones, simulaciones y Modo Caos
- * Incluye estrategia de fallback: gemini-3.5-flash → gemini-3.5-flash-lite
+ * Usa una solicitud al servidor por operación y respaldo conversacional local en fallos.
  */
 class GeminiService {
   private chatHistory: GeminiContent[] = [];
@@ -44,12 +52,18 @@ class GeminiService {
   private lastChaosTrigger = 0;
   /** Secuencia de turno: permite descartar respuestas obsoletas. */
   private requestSeq = 0;
+  private operationSeq = 0;
   private usingFallback = false;
+  private localTurnIndex = 0;
+  private localAskedQuestions = new Set<number>();
+  private localizeAbortedTurn = false;
+  private currentCandidateProfile: { fullName?: string; headline?: string; bio?: string; goal?: string; skills?: string[]; yearsOfExperience?: number; education?: string } = {};
+  private fallbackReason: string | null = null;
 
   /**
    * Prepara el cliente local; las credenciales y la configuración del modelo viven en el servidor.
    */
-  initialize(config?: Partial<GeminiConfig>): { ok: true; value: void } | { ok: false; error: { message: string; code: string; retryable: boolean; details?: Record<string, unknown>; originalError?: Error } } {
+  initialize(config?: Partial<GeminiConfig>): { ok: true; value: void } | { ok: false; error: AIServiceFailure & { originalError?: Error } } {
     try {
       this.config = {
         model: config?.model ?? PRIMARY_MODEL,
@@ -65,13 +79,14 @@ class GeminiService {
 
       return { ok: true, value: undefined };
     } catch (error) {
-      console.error('[GeminiService] initialize failed:', error instanceof Error ? error.message : String(error));
+      console.error('[GeminiService] initialize failed (CONFIGURATION_ERROR).');
       return {
         ok: false,
         error: {
           message: 'Error al inicializar el cliente de Gemini',
           code: 'CONFIG_MISSING',
           retryable: false,
+          category: 'CONFIGURATION_ERROR',
           originalError: error instanceof Error ? error : undefined,
         },
       };
@@ -99,15 +114,17 @@ class GeminiService {
     return this.usingFallback;
   }
 
+  getFallbackReason(): string | null { return this.fallbackReason; }
+
   /**
    * Genera contenido mediante la función autenticada del servidor.
    */
-  async generateContent(prompt: string, signal?: AbortSignal): Promise<{ ok: true; value: string } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  async generateContent(prompt: string, signal?: AbortSignal, operationType: AiOperationType = 'content'): Promise<{ ok: true; value: string } | { ok: false; error: AIServiceFailure }> {
     if (!this.isConfigured()) {
-      return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false } };
+      return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false, category: 'CONFIGURATION_ERROR' } };
     }
 
-    return this.requestText({ prompt }, signal);
+    return this.requestText({ prompt }, signal, operationType);
   }
 
   /**
@@ -115,18 +132,17 @@ class GeminiService {
    */
   async startSimulation(
     scenarioConfig: ScenarioConfig,
-    userProfile: { role: string; experienceLevel: string },
+    userProfile: { role: string; experienceLevel: string; fullName?: string; headline?: string; bio?: string; goal?: string; skills?: string[]; yearsOfExperience?: number; education?: string },
     interviewer: InterviewerProfile = DEFAULT_INTERVIEWER,
-  ): Promise<{ ok: true; value: SimulationSession } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
-    if (!this.isConfigured()) {
-      return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false } };
-    }
-
+    localOnly = false,
+    localFallbackReason = 'Escenario predefinido',
+  ): Promise<{ ok: true; value: SimulationSession } | { ok: false; error: AIServiceFailure }> {
     if (this.isProcessing) {
       return { ok: false, error: { message: 'Ya hay una operación en curso', code: 'UNKNOWN_ERROR', retryable: true } };
     }
 
     this.isProcessing = true;
+    const operationId = ++this.operationSeq;
     this.abortController = new AbortController();
 
     try {
@@ -136,6 +152,7 @@ class GeminiService {
       this.currentSession = {
         id: sessionId,
         scenarioId: scenarioConfig.id,
+        candidateName: userProfile.fullName?.trim() || undefined,
         status: 'active',
         scenarioState: initialState,
         messages: [],
@@ -145,24 +162,62 @@ class GeminiService {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
+      this.lastChaosTrigger = 0;
+      this.localTurnIndex = 0;
+      this.localAskedQuestions = new Set<number>();
+      this.currentCandidateProfile = userProfile;
+      this.usingFallback = localOnly;
+      this.fallbackReason = localOnly ? localFallbackReason : null;
+      this.localizeAbortedTurn = false;
 
-      const systemPrompt = this.buildSystemPrompt(scenarioConfig, userProfile, initialState, interviewer);
+      const systemPrompt = this.buildSystemPrompt(
+        scenarioConfig,
+        { ...userProfile, candidateName: userProfile.fullName?.trim() || undefined },
+        initialState,
+        interviewer,
+      );
       this.chatHistory = [
         { role: 'user', parts: [{ text: systemPrompt }] },
         { role: 'model', parts: [{ text: 'Entendido. Iniciemos la simulación.' }] },
       ];
 
-      const welcomeMessage = await this.generateWelcomeMessageWithModel(scenarioConfig, initialState, interviewer);
-      this.currentSession.messages.push(welcomeMessage);
-      this.usingFallback = false;
-      return { ok: true, value: this.currentSession };
+      const welcomeStartedAt = performance.now();
+      try {
+        if (this.usingFallback) throw new Error('LOCAL_SCENARIO');
+        const welcomeMessage = await this.generateWelcomeMessageWithModel(scenarioConfig, initialState, interviewer, userProfile);
+        if (this.operationSeq !== operationId || this.currentSession?.id !== sessionId) {
+          return { ok: false, error: { message: 'La entrevista se cerró antes de completar el inicio.', code: 'ABORTED', retryable: false } };
+        }
+        this.currentSession.messages.push(welcomeMessage);
+        this.usingFallback = false;
+        this.latencyMark('bienvenida Gemini', welcomeStartedAt, 'ok');
+        return { ok: true, value: this.currentSession };
+      } catch (welcomeError) {
+        if (this.operationSeq !== operationId || this.currentSession?.id !== sessionId) {
+          return { ok: false, error: { message: 'La entrevista se cerró antes de completar el inicio.', code: 'ABORTED', retryable: false } };
+        }
+        const classified = this.mapGeminiError(welcomeError);
+        const localModeSelected = this.fallbackReason === 'LOCAL_FALLBACK_SELECTED'
+          && classified.category === 'CANCELLED';
+        const fallbackCode = localModeSelected ? 'LOCAL_FALLBACK_SELECTED' : classified.code;
+        if (!localOnly) this.fallbackReason = fallbackCode;
+        if (!localOnly && !localModeSelected) console.warn('[GeminiService] No se pudo generar bienvenida con Gemini (' + classified.code + '). Activando fallback local sin bloquear la entrevista.');
+        const localWelcome = generateLocalWelcomeMessage(scenarioConfig, interviewer, userProfile.fullName);
+        this.currentSession.messages.push(localWelcome);
+        this.usingFallback = true;
+        this.latencyMark('bienvenida local', welcomeStartedAt, 'local');
+        return { ok: true, value: this.currentSession };
+      }
     } catch (error) {
-      this.currentSession = null;
-      this.chatHistory = [];
-      console.error('[GeminiService] startSimulation failed:', error instanceof Error ? error.message : String(error));
-      return { ok: false, error: this.mapGeminiError(error) };
+      if (this.operationSeq === operationId) {
+        this.currentSession = null;
+        this.chatHistory = [];
+      }
+      const classified = this.mapGeminiError(error);
+      console.error('[GeminiService] startSimulation failed.', { category: classified.category ?? 'UNKNOWN_ERROR', code: classified.code });
+      return { ok: false, error: classified };
     } finally {
-      this.isProcessing = false;
+      if (this.operationSeq === operationId) this.isProcessing = false;
     }
   }
 
@@ -170,10 +225,10 @@ class GeminiService {
    * Inicia una simulación con un escenario dinámico generado por IA
    */
   async startDynamicSimulation(
-    dynamicScenario: { id: string; title: string; description: string; difficulty: string },
-    userProfile: { role: string; experienceLevel: string; skills?: string[]; yearsOfExperience?: number },
+    dynamicScenario: { id: string; title: string; description: string; difficulty: string; fallbackReason?: string },
+    userProfile: { role: string; experienceLevel: string; fullName?: string; headline?: string; bio?: string; goal?: string; skills?: string[]; yearsOfExperience?: number; education?: string },
     interviewer: InterviewerProfile = DEFAULT_INTERVIEWER,
-  ): Promise<{ ok: true; value: SimulationSession } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  ): Promise<{ ok: true; value: SimulationSession } | { ok: false; error: AIServiceFailure }> {
     const scenarioConfig: ScenarioConfig = {
       id: dynamicScenario.id as any,
       title: dynamicScenario.title,
@@ -205,13 +260,19 @@ class GeminiService {
       chaosEvents: [],
     };
 
-    return this.startSimulation(scenarioConfig, userProfile, interviewer);
+    return this.startSimulation(
+      scenarioConfig,
+      userProfile,
+      interviewer,
+      Boolean((dynamicScenario as { isFallback?: boolean }).isFallback),
+      dynamicScenario.fallbackReason || 'Escenario predefinido',
+    );
   }
 
   /**
    * Envía un mensaje del usuario y obtiene respuesta
    */
-  async sendMessage(content: string): Promise<{ ok: true; value: { message: ChatMessage; events: never[]; scenarioState: ScenarioState } } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  async sendMessage(content: string): Promise<{ ok: true; value: { message: ChatMessage; events: never[]; scenarioState: ScenarioState } } | { ok: false; error: AIServiceFailure }> {
     if (!this.currentSession || this.chatHistory.length === 0) {
       return { ok: false, error: { message: 'No hay simulación activa', code: 'NO_ACTIVE_SIMULATION', retryable: false } };
     }
@@ -233,7 +294,9 @@ class GeminiService {
     }
 
     this.isProcessing = true;
+    const operationId = ++this.operationSeq;
     this.abortController = new AbortController();
+    const sessionAtStart = this.currentSession;
 
     // Secuencia de turno: si el usuario interrumpe y empieza otro turno,
     // la respuesta antigua se descarta en lugar de sobrescribir el estado nuevo.
@@ -247,42 +310,90 @@ class GeminiService {
       timestamp: Date.now(),
     };
 
+    const isCandidateNameAnswer = !this.currentSession.candidateName && this.currentSession.messages.length === 1;
+    if (isCandidateNameAnswer) {
+      const candidateName = content.trim().replace(/\s+/g, ' ').slice(0, 80);
+      userMessage.metadata = { isCandidateName: true };
+      this.currentSession.candidateName = candidateName;
+      this.currentCandidateProfile = { ...this.currentCandidateProfile, fullName: candidateName };
+      this.currentSession.messages.push(userMessage);
+      const nameTurn = generateLocalCandidateNameTurn(candidateName);
+      this.currentSession.messages.push(nameTurn);
+      this.chatHistory.push(
+        { role: 'user', parts: [{ text: `La persona candidata se llama ${candidateName}. Este es el nombre del candidato, no el de la persona entrevistadora.` }] },
+        { role: 'model', parts: [{ text: nameTurn.content }] },
+      );
+      this.currentSession.updatedAt = Date.now();
+      this.isProcessing = false;
+      return { ok: true, value: { message: nameTurn, events: [], scenarioState: this.currentSession.scenarioState } };
+    }
+
     // El mensaje del usuario se añade UNA sola vez, fuera del bucle de reintentos.
     this.currentSession.messages.push(userMessage);
     this.latencyMark('turno preparado', turnStart);
 
-    const MAX_ATTEMPTS = 3;
-    const BACKOFF_MS = [0, 600, 1400];
-    let lastError: { message: string; code: string; retryable: boolean } | null = null;
-
     try {
-      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-        if (attempt > 0) {
-          await GeminiService.sleep(BACKOFF_MS[attempt] ?? 1400);
-          if (seq !== this.requestSeq) {
-            return { ok: false, error: { message: 'Turno cancelado por una intervención más reciente.', code: 'ABORTED', retryable: false } };
-          }
-        }
+      if (this.usingFallback) {
+        const localFollowUpStartedAt = performance.now();
+        const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+        this.currentSession.messages.push(localTurn.message);
+        this.currentSession.scenarioState = localTurn.scenarioState;
+        if (localTurn.completed) this.currentSession.status = 'completed';
+        this.currentSession.updatedAt = Date.now();
+        this.chatHistory.push({ role: 'user', parts: [{ text: content.trim() }] }, { role: 'model', parts: [{ text: localTurn.message.content }] });
+        this.latencyMark('seguimiento local', localFollowUpStartedAt, 'local');
+        return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
+      }
 
-        try {
-          const modelStart = performance.now();
+      const modelStart = performance.now();
           const userTurn: GeminiContent = { role: 'user', parts: [{ text: content.trim() }] };
           const result = await this.requestText(
             { contents: [...this.chatHistory, userTurn] },
             this.abortController?.signal,
+            'turn',
           );
+          if (this.operationSeq !== operationId || this.currentSession !== sessionAtStart) {
+            return { ok: false, error: { message: 'La sesión terminó antes de completar la respuesta.', code: 'ABORTED', retryable: false } };
+          }
+          if (this.localizeAbortedTurn && this.currentSession) {
+            this.localizeAbortedTurn = false;
+            this.usingFallback = true;
+            this.fallbackReason = 'INTERRUPTED_LOCAL';
+            const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+            this.currentSession.messages.push(localTurn.message);
+            this.currentSession.scenarioState = localTurn.scenarioState;
+            if (localTurn.completed) this.currentSession.status = 'completed';
+            this.currentSession.updatedAt = Date.now();
+            this.chatHistory.push(userTurn, { role: 'model', parts: [{ text: localTurn.message.content }] });
+            this.latencyMark('seguimiento local por interrupción', turnStart, 'local');
+            return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
+          }
           if (!result.ok) {
-            lastError = result.error;
-            if (!lastError.retryable) break;
-            continue;
+            if (result.error.code === 'ABORTED') return { ok: false, error: result.error };
+            this.usingFallback = true;
+            this.fallbackReason = result.error.code;
+            const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+            this.currentSession.messages.push(localTurn.message);
+            this.currentSession.scenarioState = localTurn.scenarioState;
+            if (localTurn.completed) this.currentSession.status = 'completed';
+            this.currentSession.updatedAt = Date.now();
+            this.chatHistory.push(userTurn, { role: 'model', parts: [{ text: localTurn.message.content }] });
+            this.latencyMark('seguimiento local tras error', turnStart, result.error.code);
+            return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
           }
           const responseText = result.value;
           this.latencyMark('respuesta de Gemini', modelStart);
           this.latencyMark('turno completo (usuario → texto de respuesta)', turnStart);
 
           if (!responseText || !responseText.trim()) {
-            lastError = { message: 'El servicio de IA devolvió una respuesta vacía.', code: 'EMPTY_RESPONSE', retryable: true };
-            continue;
+            this.usingFallback = true;
+            this.fallbackReason = 'INVALID_RESPONSE';
+            const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+            this.currentSession.messages.push(localTurn.message);
+            this.currentSession.scenarioState = localTurn.scenarioState;
+            if (localTurn.completed) this.currentSession.status = 'completed';
+            this.latencyMark('seguimiento local tras respuesta vacía', turnStart, 'INVALID_RESPONSE');
+            return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
           }
 
           // Descarta la respuesta si ya empezó un turno más reciente.
@@ -305,33 +416,50 @@ class GeminiService {
           this.currentSession.updatedAt = Date.now();
 
           return { ok: true, value: { message: modelMessage, events: [], scenarioState: updatedState } };
-        } catch (attemptError) {
+    } catch (attemptError) {
+          if (this.operationSeq !== operationId || this.currentSession !== sessionAtStart) {
+            return { ok: false, error: { message: 'La sesión terminó antes de completar la respuesta.', code: 'ABORTED', retryable: false } };
+          }
           if (attemptError instanceof Error && attemptError.name === 'AbortError') {
+            if (this.localizeAbortedTurn && this.currentSession) {
+              this.localizeAbortedTurn = false;
+              this.usingFallback = true;
+              this.fallbackReason = 'INTERRUPTED_LOCAL';
+              const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+              this.currentSession.messages.push(localTurn.message);
+              this.currentSession.scenarioState = localTurn.scenarioState;
+              if (localTurn.completed) this.currentSession.status = 'completed';
+              this.currentSession.updatedAt = Date.now();
+              const userTurn: GeminiContent = { role: 'user', parts: [{ text: content.trim() }] };
+              this.chatHistory.push(userTurn, { role: 'model', parts: [{ text: localTurn.message.content }] });
+              this.latencyMark('seguimiento local por interrupción', turnStart, 'local');
+              return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
+            }
             return { ok: false, error: { message: 'Solicitud cancelada.', code: 'ABORTED', retryable: false } };
           }
           const classified = this.mapGeminiError(attemptError);
-          lastError = classified;
-          console.error(`[GeminiService] sendMessage intento ${attempt + 1}/${MAX_ATTEMPTS} falló:`, classified.code);
-
-          // Los errores permanentes no se reintentan.
-          if (!classified.retryable) break;
-        }
-      }
-
-      return {
-        ok: false,
-        error: lastError ?? { message: 'No se pudo obtener respuesta del servicio de IA.', code: 'UNKNOWN_ERROR', retryable: true },
-      };
-    } finally {
+          if (classified.code !== 'ABORTED') {
+            this.usingFallback = true;
+            this.fallbackReason = classified.code;
+            const localTurn = generateLocalFollowUpTurn(content, this.localTurnIndex++, this.currentSession.scenarioState, this.localAskedQuestions);
+            this.currentSession.messages.push(localTurn.message);
+            this.currentSession.scenarioState = localTurn.scenarioState;
+            if (localTurn.completed) this.currentSession.status = 'completed';
+            this.latencyMark('seguimiento local tras error', turnStart, classified.code);
+            return { ok: true, value: { message: localTurn.message, events: [], scenarioState: localTurn.scenarioState } };
+          }
+          return { ok: false, error: classified };
+    }
+    finally {
       // Solo liberamos el flag si este sigue siendo el turno actual.
-      if (seq === this.requestSeq) this.isProcessing = false;
+      if (seq === this.requestSeq && this.operationSeq === operationId) this.isProcessing = false;
     }
   }
 
   /**
    * Activa Modo Caos - introduce un evento inesperado
    */
-  async triggerChaos(): Promise<{ ok: true; value: { event: SimulationEvent; response: ChatMessage; scenarioState: ScenarioState } } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  async triggerChaos(): Promise<{ ok: true; value: { event: SimulationEvent; response: ChatMessage; scenarioState: ScenarioState } } | { ok: false; error: AIServiceFailure }> {
     if (!this.currentSession || this.chatHistory.length === 0) {
       return { ok: false, error: { message: 'No hay simulación activa', code: 'NO_ACTIVE_SIMULATION', retryable: false } };
     }
@@ -350,15 +478,15 @@ class GeminiService {
     }
 
     this.isProcessing = true;
-    this.lastChaosTrigger = now;
-    this.currentSession.status = 'chaos_active';
+    const operationId = ++this.operationSeq;
     this.abortController = new AbortController();
+    const sessionAtStart = this.currentSession;
+    const startedAt = performance.now();
 
     try {
       const chaosEvent = this.generateChaosEvent(this.currentSession!);
       if (!chaosEvent) {
         // No simulamos éxito: informamos y dejamos la simulación como estaba.
-        this.currentSession!.status = 'active';
         return {
           ok: false,
           error: {
@@ -369,60 +497,104 @@ class GeminiService {
         };
       }
 
-      this.currentSession!.status = 'active';
-
-      const chaosPrompt = this.buildChaosPrompt(chaosEvent);
-      const chaosTurn: GeminiContent = { role: 'user', parts: [{ text: chaosPrompt }] };
-      const result = await this.requestText(
-        { contents: [...this.chatHistory, chaosTurn] },
-        this.abortController?.signal,
-      );
-      if (!result.ok) {
-        this.currentSession!.status = 'active';
-        return { ok: false, error: result.error };
+      let responseText: string;
+      let updatedState: ScenarioState;
+      let chaosResponse: ChatMessage;
+      if (this.usingFallback) {
+        const localTurn = generateLocalChaosTurn(chaosEvent, this.currentSession!.scenarioState);
+        responseText = localTurn.message.content;
+        updatedState = localTurn.scenarioState;
+        chaosResponse = localTurn.message;
+        const localChaosPrompt = this.buildChaosPrompt(chaosEvent);
+        this.chatHistory.push(
+          { role: 'user', parts: [{ text: localChaosPrompt }] },
+          { role: 'model', parts: [{ text: responseText }] },
+        );
+        this.latencyMark('imprevisto local', startedAt, 'local');
+      } else {
+        const chaosPrompt = this.buildChaosPrompt(chaosEvent);
+        const chaosTurn: GeminiContent = { role: 'user', parts: [{ text: chaosPrompt }] };
+        const result = await this.requestText(
+          { contents: [...this.chatHistory, chaosTurn] },
+          this.abortController?.signal,
+          'chaos',
+        );
+        if (this.operationSeq !== operationId || this.currentSession !== sessionAtStart) {
+          return { ok: false, error: { message: 'La sesión terminó antes de completar el imprevisto.', code: 'ABORTED', retryable: false } };
+        }
+        if (!result.ok) {
+          if (result.error.code === 'ABORTED') {
+            this.currentSession!.status = 'active';
+            return { ok: false, error: result.error };
+          }
+          this.usingFallback = true;
+          this.fallbackReason = result.error.code;
+          const localTurn = generateLocalChaosTurn(chaosEvent, this.currentSession!.scenarioState);
+          responseText = localTurn.message.content;
+          updatedState = localTurn.scenarioState;
+          chaosResponse = localTurn.message;
+          this.chatHistory.push(chaosTurn, { role: 'model', parts: [{ text: responseText }] });
+          this.latencyMark('imprevisto con respaldo local', startedAt, result.error.code);
+        } else {
+          responseText = result.value;
+          updatedState = this.extractScenarioState(responseText, this.currentSession!.scenarioState);
+          chaosResponse = {
+            id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+            role: 'model',
+            content: responseText,
+            timestamp: Date.now(),
+            metadata: { eventId: chaosEvent.id },
+          };
+          this.chatHistory.push(chaosTurn, { role: 'model', parts: [{ text: responseText }] });
+          this.latencyMark('imprevisto Gemini', startedAt, 'ok');
+        }
       }
-      const responseText = result.value;
+
       this.currentSession!.events.push(chaosEvent);
-
-      const chaosResponse: ChatMessage = {
-        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-        role: 'model',
-        content: responseText,
-        timestamp: Date.now(),
-        metadata: { eventId: chaosEvent.id },
-      };
-
       this.currentSession!.messages.push(chaosResponse);
-      this.chatHistory.push(chaosTurn, { role: 'model', parts: [{ text: responseText }] });
-
-      const updatedState = this.extractScenarioState(responseText, this.currentSession!.scenarioState);
       chaosEvent.scenarioChanges = { ...updatedState };
       chaosEvent.status = 'active';
       chaosEvent.relatedMessageId = chaosResponse.id;
 
       this.currentSession!.scenarioState = updatedState;
+      this.currentSession!.status = 'active';
       this.currentSession!.updatedAt = Date.now();
+      this.lastChaosTrigger = now;
 
       return { ok: true, value: { event: chaosEvent, response: chaosResponse, scenarioState: updatedState } };
     } catch (error) {
-      if (this.currentSession) this.currentSession.status = 'error';
-      console.error('[GeminiService] triggerChaos failed:', error instanceof Error ? error.message : String(error));
-      return { ok: false, error: this.mapGeminiError(error) };
+      const classified = this.mapGeminiError(error);
+      if (this.currentSession === sessionAtStart) this.currentSession.status = 'active';
+      console.error('[GeminiService] triggerChaos failed:', classified.code);
+      this.latencyMark('imprevisto fallido', startedAt, classified.code);
+      return { ok: false, error: classified };
     } finally {
-      this.isProcessing = false;
+      if (this.operationSeq === operationId) this.isProcessing = false;
     }
   }
 
   /**
    * Genera escenarios de entrevista dinámicos basados en el perfil del usuario
-   * Con reintento automático con prompt simplificado si falla
+   * Intenta Gemini una vez y devuelve escenarios predefinidos ante cualquier fallo recuperable.
    */
   async generateScenariosFromProfile(
-    userProfile: { fullName?: string; skills?: string[]; yearsOfExperience?: number; headline?: string; bio?: string; goal?: string },
+    userProfile: { fullName?: string; skills?: string[]; yearsOfExperience?: number; headline?: string; bio?: string; goal?: string; education?: string },
     signal?: AbortSignal,
-  ): Promise<{ ok: true; value: { id: string; title: string; description: string; difficulty: string }[] } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+  ): Promise<{ ok: true; value: { id: string; title: string; description: string; difficulty: string; isFallback?: boolean }[] } | { ok: false; error: AIServiceFailure }> {
+    const scenarioStartedAt = performance.now();
+    const localScenarios = (fallbackReason = 'Escenario predefinido') => Object.values(SCENARIOS).slice(0, 5).map((cfg) => ({ id: cfg.id, title: cfg.title, description: cfg.description, difficulty: 'medio', isFallback: true, fallbackReason }));
+    const hasProfessionalContext = Boolean(
+      userProfile.headline?.trim() || userProfile.skills?.some((skill) => skill.trim()) ||
+      userProfile.bio?.trim() || userProfile.goal?.trim() || userProfile.education?.trim() ||
+      (typeof userProfile.yearsOfExperience === 'number' && userProfile.yearsOfExperience > 0),
+    );
+    if (!hasProfessionalContext) {
+      this.latencyMark('escenarios predefinidos', scenarioStartedAt, 'NO_PROFILE_CONTEXT');
+      return { ok: true, value: localScenarios('Perfil sin datos profesionales suficientes') };
+    }
     if (!this.isConfigured()) {
-      return { ok: false, error: { message: 'Servicio Gemini no inicializado', code: 'CONFIG_MISSING', retryable: false } };
+      this.latencyMark('escenarios predefinidos', scenarioStartedAt, 'CONFIG_MISSING');
+      return { ok: true, value: localScenarios('CONFIG_MISSING') };
     }
 
     const skills = userProfile.skills?.join(', ') || 'No especificadas';
@@ -430,11 +602,9 @@ class GeminiService {
     const headline = userProfile.headline || 'Profesional';
     const bio = userProfile.bio || '';
     const goal = userProfile.goal || '';
+    const education = userProfile.education || '';
 
-    const buildPrompt = (simplified: boolean) => {
-      if (simplified) {
-        return `Genera 3 escenarios de entrevista laboral para alguien con estas habilidades: ${skills}. Experiencia: ${experience} años. Responde SOLO con JSON: {"scenarios":[{"id":"1","title":"...","description":"...","difficulty":"medio"}]}`;
-      }
+    const buildPrompt = () => {
       return `Genera 5 escenarios de entrevista laboral personalizados para este perfil profesional.
 
 PERFIL DEL USUARIO:
@@ -442,6 +612,7 @@ PERFIL DEL USUARIO:
 - Titular: ${headline}
 - Habilidades: ${skills}
 - Años de experiencia: ${experience}
+- Estudios: ${education || 'No especificados'}
 - Biografía: ${bio}
 - Objetivo: ${goal}
 
@@ -464,109 +635,48 @@ Responde ÚNICAMENTE con un JSON válido en este formato:
 No incluyas texto fuera del JSON.`;
     };
 
-    const parseScenarios = (responseText: string): { id: string; title: string; description: string; difficulty: string }[] => {
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No se encontró JSON en la respuesta');
-      }
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      const scenarios = Array.isArray(parsed.scenarios) ? parsed.scenarios : [];
-
-      const validScenarios = scenarios
-        .filter((s: any) => {
-          if (!s || typeof s !== 'object') return false;
-          if (typeof s.id !== 'string' || s.id.trim() === '') return false;
-          if (typeof s.title !== 'string' || s.title.trim() === '') return false;
-          if (typeof s.description !== 'string' || s.description.trim() === '') return false;
-          return true;
-        })
-        .map((s: any, i: number) => ({
-          id: s.id || `scenario_${i + 1}`,
-          title: s.title.trim(),
-          description: s.description.trim(),
-          difficulty: ['facil', 'medio', 'dificil'].includes(s.difficulty) ? s.difficulty : 'medio',
-        }));
-
-      if (validScenarios.length === 0) {
-        throw new Error('No se generaron escenarios válidos');
-      }
-
-      if (validScenarios.length > 10) {
-        validScenarios.splice(10);
-      }
-
-      const ids = new Set(validScenarios.map((s: any) => s.id));
-      if (ids.size !== validScenarios.length) {
-        validScenarios.forEach((s: any, i: number) => {
-          s.id = `scenario_${i + 1}`;
-        });
-      }
-
-      return validScenarios;
+    const getFallbackScenarios = (fallbackReason = 'Escenario predefinido'): { id: string; title: string; description: string; difficulty: string; isFallback?: boolean; fallbackReason?: string }[] => {
+      return Object.values(SCENARIOS).slice(0, 5).map((cfg) => ({
+        id: cfg.id,
+        title: cfg.title,
+        description: cfg.description,
+        difficulty: cfg.initialState.constraints.some((c) => c.toLowerCase().includes('dificil'))
+          ? 'dificil'
+          : cfg.initialState.constraints.some((c) => c.toLowerCase().includes('facil'))
+            ? 'facil'
+            : 'medio',
+        isFallback: true,
+        fallbackReason,
+      }));
     };
 
-    const shouldRetryGeneration = (code: string) =>
-      code !== 'QUOTA_EXCEEDED' &&
-      code !== 'UNAUTHENTICATED' &&
-      code !== 'CONFIG_MISSING' &&
-      code !== 'ABORTED';
-
     try {
-      const result = await this.generateContent(buildPrompt(false), signal);
+      const result = await this.generateContent(buildPrompt(), signal, 'scenarios');
+      this.latencyMark('generación de escenarios', scenarioStartedAt, result.ok ? 'ok' : result.error.code);
 
       if (!result.ok) {
-        if (!shouldRetryGeneration(result.error.code)) {
-          return { ok: false, error: result.error };
-        }
-        throw Object.assign(new Error(result.error.message), { code: result.error.code });
+        if (result.error.code === 'ABORTED') return { ok: false, error: result.error };
+        // Cualquier indisponibilidad o respuesta inválida debe permitir practicar localmente;
+        // el motivo real queda asociado a cada escenario y no se disfraza como cuota agotada.
+        this.latencyMark('escenarios predefinidos', scenarioStartedAt, result.error.code);
+        return { ok: true, value: localScenarios(result.error.code) };
       }
 
-      const scenarios = parseScenarios(result.value);
+      const scenarios = parseScenariosResponse(result.value);
       return { ok: true, value: scenarios };
     } catch (firstError) {
       const firstCode = typeof firstError === 'object' && firstError !== null && 'code' in firstError
         ? String((firstError as { code: unknown }).code)
         : '';
-      console.error('[GeminiService] Primer intento falló:', firstError instanceof Error ? firstError.message : String(firstError));
-      if (!shouldRetryGeneration(firstCode)) {
-        return {
-          ok: false,
-          error: {
-            message: firstError instanceof Error ? firstError.message : 'Error al generar escenarios',
-            code: firstCode || 'GENERATION_ERROR',
-            retryable: false,
-          },
-        };
+      if (firstCode === 'ABORTED') {
+        return { ok: false, error: { message: 'Generación de escenarios cancelada.', code: firstCode, retryable: false } };
       }
-
-      try {
-        const retryResult = await this.generateContent(buildPrompt(true), signal);
-
-        if (!retryResult.ok) {
-          return {
-            ok: false,
-            error: {
-              ...retryResult.error,
-              retryable: shouldRetryGeneration(retryResult.error.code) && retryResult.error.retryable,
-            },
-          };
-        }
-
-        const scenarios = parseScenarios(retryResult.value);
-        return { ok: true, value: scenarios };
-      } catch (retryError) {
-        console.error('[GeminiService] Reintento también falló:', retryError instanceof Error ? retryError.message : String(retryError));
-
-        return {
-          ok: false,
-          error: {
-            message: retryError instanceof Error ? retryError.message : 'Error al generar escenarios',
-            code: 'GENERATION_ERROR',
-            retryable: true,
-          },
-        };
+      if (firstCode === 'UNAUTHENTICATED' || firstCode === 'PERMISSION_DENIED') {
+        return { ok: true, value: localScenarios(firstCode) };
       }
+      console.warn('[GeminiService] Respuesta de escenarios no válida; se mostrarán escenarios predefinidos.');
+      this.latencyMark('generación de escenarios local', scenarioStartedAt, firstCode || 'INVALID_RESPONSE');
+      return { ok: true, value: getFallbackScenarios(firstCode || 'INVALID_RESPONSE') };
     }
   }
 
@@ -581,12 +691,17 @@ No incluyas texto fuera del JSON.`;
    * Finaliza la simulación actual
    */
   endSimulation(): void {
+    this.operationSeq += 1;
+    this.requestSeq += 1;
     if (this.currentSession) {
       this.currentSession.status = 'completed';
       this.currentSession.updatedAt = Date.now();
     }
     this.chatHistory = [];
     this.currentSession = null;
+    this.localTurnIndex = 0;
+    this.localAskedQuestions = new Set<number>();
+    this.localizeAbortedTurn = false;
     this.isProcessing = false;
     if (this.abortController) {
       this.abortController.abort();
@@ -612,6 +727,7 @@ No incluyas texto fuera del JSON.`;
   abortCurrentTurn(): void {
     // Incrementar la secuencia hace que cualquier respuesta en vuelo se descarte.
     this.requestSeq += 1;
+    this.localizeAbortedTurn = false;
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
@@ -626,75 +742,105 @@ No incluyas texto fuera del JSON.`;
     return this.isProcessing;
   }
 
+  /** Cancela la llamada del turno y devuelve una continuación local para la respuesta ya recibida. */
+  interruptCurrentTurnLocally(): boolean {
+    if (!this.currentSession || !this.isProcessing || this.currentSession.status !== 'active') return false;
+    this.localizeAbortedTurn = true;
+    this.usingFallback = true;
+    this.fallbackReason = 'INTERRUPTED_LOCAL';
+    this.abortController?.abort();
+    return true;
+  }
+
+  /** Aborta la bienvenida en curso a petición del usuario y continúa con la bienvenida local. */
+  continueWithLocalFallback(): boolean {
+    if (!this.currentSession || !this.isProcessing) return false;
+    this.usingFallback = true;
+    this.fallbackReason = 'LOCAL_FALLBACK_SELECTED';
+    this.abortController?.abort();
+    return true;
+  }
+
   // ==================== MÉTODOS PRIVADOS ====================
 
   private mapFunctionError(
     status: number,
-    result: { error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } } | null,
-  ): { message: string; code: string; retryable: boolean } {
-    const code = typeof result?.error?.code === 'string' ? result.error.code : 'UNKNOWN_ERROR';
-    const retryAfterSeconds = typeof result?.error?.retryAfterSeconds === 'number' ? result.error.retryAfterSeconds : null;
-    const isUnauthenticated = code === 'unauthenticated' || code.startsWith('unauthenticated:');
-    const mappedCode = code === 'resource-exhausted' ? 'QUOTA_EXCEEDED'
-      : isUnauthenticated ? 'UNAUTHENTICATED'
-        : code === 'network-error' ? 'NETWORK_ERROR'
-          : code === 'configuration-error' ? 'CONFIG_MISSING'
-            : code === 'invalid-argument' ? 'INVALID_RESPONSE'
-              : code.toUpperCase().replaceAll('-', '_');
-    const defaultMessage = mappedCode === 'QUOTA_EXCEEDED'
-      ? 'Se agotó la cuota del servicio de IA. Espera o revisa el uso del proyecto.'
-      : `Error del servicio de IA (${status}).`;
-    let message = typeof result?.error?.message === 'string' ? result.error.message : defaultMessage;
-    if (code.startsWith('unauthenticated:')) {
-      const diagnostic = code.replace('unauthenticated:', '');
-      console.warn(`[GeminiService] Validación de sesión Firebase fallida: ${diagnostic}`);
+    result: { ok?: unknown; error?: { message?: unknown; code?: unknown; category?: unknown; retryAfterSeconds?: unknown; sourceCode?: unknown; sourceStatus?: unknown } } | null,
+  ): AIServiceFailure {
+    const normalized = normalizeGeminiFunctionError(status, result);
+    const firebaseAuthCode = typeof result?.error?.code === 'string' && result.error.code.startsWith('unauthenticated:')
+      ? result.error.code.replace('unauthenticated:', '')
+      : undefined;
+    if (normalized.category === 'AUTHENTICATION_ERROR' && firebaseAuthCode) {
+      const diagnostic = firebaseAuthCode;
+      console.warn('[GeminiService] La función rechazó el token de sesión Firebase.', { sourceCode: diagnostic, category: normalized.category, httpStatus: status });
       if (diagnostic === 'auth/id-token-expired') {
-        message = 'Tu sesión de Firebase expiró. Inicia sesión nuevamente con Google para renovarla.';
+        normalized.message = 'Tu sesión de Firebase expiró. Inicia sesión nuevamente con Google para renovarla.';
       } else if (diagnostic === 'auth/argument-error' || diagnostic === 'auth/invalid-id-token') {
-        message = 'Tu sesión de Google no coincide con el proyecto de Firebase configurado en el servidor.';
+        normalized.message = 'Tu sesión de Google no coincide con el proyecto de Firebase configurado en el servidor.';
       }
     }
-    const retryable = mappedCode !== 'QUOTA_EXCEEDED'
-      && mappedCode !== 'UNAUTHENTICATED'
-      && mappedCode !== 'CONFIG_MISSING'
-      && status >= 500;
-    if (mappedCode === 'QUOTA_EXCEEDED' && retryAfterSeconds && retryAfterSeconds > 0 && retryAfterSeconds <= 120) {
-      return {
-        message: `El servicio de IA pidió esperar ${retryAfterSeconds} segundos antes de reintentar.`,
-        code: mappedCode,
-        retryable: false,
-      };
-    }
-    return { message, code: mappedCode, retryable };
+    return normalized;
   }
 
   private async requestText(
     body: { prompt: string } | { contents: GeminiContent[] },
     signal?: AbortSignal,
-  ): Promise<{ ok: true; value: string } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+    operationType: AiOperationType = 'content',
+  ): Promise<{ ok: true; value: string } | { ok: false; error: AIServiceFailure }> {
+    const startedAt = performance.now();
+    const operationId = this.createOperationId();
+    let requestCount = 0;
+    const logResult = (outcome: 'success' | 'error' | 'cancelled', error?: AIServiceFailure, httpStatus?: number) => {
+      if (!import.meta.env.DEV) return;
+      console.info('[ai.provider-request]', {
+        operationId,
+        operationType,
+        durationMs: Math.round(performance.now() - startedAt),
+        outcome,
+        ...(error ? {
+          category: error.category ?? 'UNKNOWN_ERROR',
+          code: error.code,
+          ...(error.sourceCode ? { sourceCode: error.sourceCode } : {}),
+          ...(error.sourceStatus !== undefined ? { sourceStatus: error.sourceStatus } : {}),
+        } : {}),
+        ...(httpStatus !== undefined ? { httpStatus } : {}),
+        engine: 'gemini',
+        functionRequestCount: requestCount,
+      });
+    };
+    if (signal?.aborted) {
+      const error: AIServiceFailure = { message: 'Solicitud cancelada.', code: 'ABORTED', retryable: false, category: 'CANCELLED' };
+      logResult('cancelled', error);
+      return { ok: false, error };
+    }
     let idToken = await getFirebaseIdToken();
     if (!idToken) {
-      return { ok: false, error: { message: 'Inicia sesión para usar la inteligencia artificial.', code: 'UNAUTHENTICATED', retryable: false } };
+      const error: AIServiceFailure = { message: 'Inicia sesión para usar la inteligencia artificial.', code: 'UNAUTHENTICATED', retryable: false, category: 'AUTHENTICATION_ERROR' };
+      logResult('error', error);
+      return { ok: false, error };
     }
 
     const send = async (token: string) => {
+      requestCount += 1;
       const response = await fetch('/api/gemini', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
+          'X-Operation-Id': operationId,
         },
         body: JSON.stringify(body),
         signal,
       });
       const result = await response.json().catch(() => null) as
-        | { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } }
+        | { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; category?: unknown; retryAfterSeconds?: unknown; sourceCode?: unknown; sourceStatus?: unknown } }
         | null;
       return { response, result };
     };
 
     let response: Response;
-    let result: { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; retryAfterSeconds?: unknown } } | null;
+    let result: { ok?: boolean; text?: unknown; usedFallback?: unknown; error?: { message?: unknown; code?: unknown; category?: unknown; retryAfterSeconds?: unknown; sourceCode?: unknown; sourceStatus?: unknown } } | null;
     try {
       ({ response, result } = await send(idToken));
       if (response.status === 401) {
@@ -705,22 +851,24 @@ No incluyas texto fuera del JSON.`;
         }
       }
     } catch (error) {
-      const aborted = error instanceof Error && error.name === 'AbortError';
-      return {
-        ok: false,
-        error: aborted
-          ? { message: 'Solicitud cancelada.', code: 'ABORTED', retryable: false }
-          : { message: 'Se perdió la conexión. Revisa tu red y reintenta.', code: 'NETWORK_ERROR', retryable: true },
-      };
+      const normalized = classifyTransportError(error);
+      const serviceError: AIServiceFailure = normalized;
+      logResult(normalized.category === 'CANCELLED' ? 'cancelled' : 'error', serviceError);
+      return { ok: false, error: serviceError };
     }
 
     if (!response.ok || !result || result.ok !== true) {
-      return { ok: false, error: this.mapFunctionError(response.status, result) };
+      const error = this.mapFunctionError(response.status, result);
+      logResult(error.category === 'CANCELLED' ? 'cancelled' : 'error', error, response.status);
+      return { ok: false, error };
     }
     if (typeof result.text !== 'string' || !result.text.trim()) {
-      return { ok: false, error: { message: 'El servicio de IA devolvió una respuesta vacía.', code: 'EMPTY_RESPONSE', retryable: true } };
+      const error: AIServiceFailure = { message: 'El servicio de IA devolvió una respuesta vacía.', code: 'EMPTY_RESPONSE', retryable: false, category: 'INVALID_RESPONSE', httpStatus: response.status };
+      logResult('error', error, response.status);
+      return { ok: false, error };
     }
     this.usingFallback = result.usedFallback === true;
+    logResult('success', undefined, response.status);
     return { ok: true, value: result.text };
   }
 
@@ -728,15 +876,18 @@ No incluyas texto fuera del JSON.`;
     scenario: ScenarioConfig,
     state: ScenarioState,
     interviewer: InterviewerProfile,
+    candidateProfile: { fullName?: string; role?: string; experienceLevel?: string; skills?: string[]; yearsOfExperience?: number; headline?: string; bio?: string; goal?: string; education?: string },
   ): Promise<ChatMessage> {
+    const candidateName = candidateProfile.fullName?.trim();
     const prompt = `Inicia la entrevista "${scenario.title}" en primera persona, como ${interviewer.name}.
-Saluda, preséntate con tu cargo y formula una sola pregunta inicial breve y profesional.
+Saluda y preséntate con tu cargo. ${candidateName ? `Dirígete al candidato como ${candidateName} y formula una pregunta laboral inicial.` : 'Antes de las preguntas laborales, pregunta al candidato cómo se llama.'}
+Formula una sola pregunta breve y profesional.
 No narres escenas, no describas acciones y no termines con "¿Qué haces?".
 Solo texto plano, diálogo directo.`;
 
     const systemPrompt = this.buildSystemPrompt(
       scenario,
-      { role: 'profesional', experienceLevel: 'intermedio' },
+      { role: candidateProfile.role || 'profesional', experienceLevel: candidateProfile.experienceLevel || 'intermedio', candidateName: candidateName || undefined },
       state,
       interviewer,
     );
@@ -746,8 +897,8 @@ Solo texto plano, diálogo directo.`;
         { role: 'model', parts: [{ text: 'Entendido.' }] },
         { role: 'user', parts: [{ text: prompt }] },
       ],
-    }, this.abortController?.signal);
-    if (!result.ok) throw new Error(result.error.message);
+    }, this.abortController?.signal, 'welcome');
+    if (!result.ok) throw Object.assign(new Error(result.error.message), result.error);
 
     return {
       id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
@@ -760,7 +911,7 @@ Solo texto plano, diálogo directo.`;
 
   private buildSystemPrompt(
     scenario: ScenarioConfig,
-    userProfile: { role: string; experienceLevel: string },
+    userProfile: { role: string; experienceLevel: string; candidateName?: string },
     state: ScenarioState,
     interviewer: InterviewerProfile = DEFAULT_INTERVIEWER,
   ): string {
@@ -780,6 +931,7 @@ CÓMO CONVERSAS
 - Hablas en primera persona, en español neutro profesional.
 - Una sola pregunta principal por turno. Intervenciones de 1 a 3 frases.
 - Escuchas la respuesta, detectas lo relevante y adaptas la siguiente pregunta a lo que acaba de decir el candidato.
+- Usa el nombre del candidato solo cuando suene natural; no lo repitas en cada turno ni vuelvas a saludar después de la apertura.
 - Puedes pedir ejemplos concretos, medibles y verificables cuando la respuesta sea vaga.
 - Puedes señalar con respeto una inconsistencia profesional y pedir aclaración.
 - Si la respuesta es pobre o evasiva, reformulas el escenario para obtener información útil.
@@ -802,6 +954,8 @@ FORMATO DE SALIDA
 
 CONTEXTO DE ESTA ENTREVISTA
 PERSONA ENTREVISTADORA: ${interviewer.name}
+PERSONA CANDIDATA: ${userProfile.candidateName || 'nombre pendiente de preguntar'}; nunca confundas su identidad con la de la persona entrevistadora.
+El nombre de la persona candidata procede del perfil o de su respuesta de registro. Si está pendiente, pregunta por él una sola vez; no uses el nombre del entrevistador para referirte al candidato.
 IDENTIDAD DE GÉNERO: ${interviewer.gender}
 CARGO: ${interviewer.role}
 ESTILO: ${interviewer.conversationalStyle}
@@ -1037,55 +1191,107 @@ INSTRUCCIONES:
    * Clasifica errores del proveedor para distinguir transitorios (reintentables)
    * de permanentes (no reintentar).
    */
-  private mapGeminiError(error: unknown): { message: string; code: string; retryable: boolean } {
+  private mapGeminiError(error: unknown): AIServiceFailure {
     const raw = error instanceof Error ? error.message : String(error);
+    if (typeof error === 'object' && error !== null && 'code' in error && typeof (error as { code?: unknown }).code === 'string') {
+      const sourceError = error as Partial<AIServiceFailure>;
+      const code = sourceError.code!;
+      const category = sourceError.category;
+      if (category) {
+        return {
+          message: raw,
+          code,
+          category,
+          retryable: Boolean(sourceError.retryable),
+          httpStatus: sourceError.httpStatus,
+          sourceCode: sourceError.sourceCode,
+          sourceStatus: sourceError.sourceStatus,
+        };
+      }
+      const known: Record<string, AIServiceFailure> = {
+        QUOTA_EXCEEDED: { message: raw, code, retryable: false, category: 'RATE_LIMIT_ERROR' },
+        UNAUTHENTICATED: { message: raw, code, retryable: false, category: 'AUTHENTICATION_ERROR' },
+        PERMISSION_DENIED: { message: raw, code, retryable: false, category: 'PERMISSION_ERROR' },
+        SERVICE_UNAVAILABLE: { message: raw, code, retryable: true, category: 'PROVIDER_ERROR' },
+        INVALID_RESPONSE: { message: raw, code, retryable: false, category: 'INVALID_RESPONSE' },
+        EMPTY_RESPONSE: { message: raw, code, retryable: false, category: 'INVALID_RESPONSE' },
+        SERVER_INTERNAL_ERROR: { message: raw, code, retryable: true, category: 'UNKNOWN_ERROR' },
+        NETWORK_ERROR: { message: raw, code, retryable: true, category: 'NETWORK_ERROR' },
+        CONFIG_MISSING: { message: raw, code, retryable: false, category: 'CONFIGURATION_ERROR' },
+        TIMEOUT_ERROR: { message: raw, code, retryable: true, category: 'TIMEOUT_ERROR' },
+        TIMEOUT: { message: raw, code, retryable: true, category: 'TIMEOUT_ERROR' },
+        ABORTED: { message: raw, code, retryable: false, category: 'CANCELLED' },
+      };
+      if (known[code]) return known[code];
+    }
     const message = raw.toLowerCase();
 
     // Permanentes: no reintentar
     if (message.includes('api key') || message.includes('api_key') || message.includes('permission denied')) {
-      return { message: 'La credencial del servicio de IA no es válida. Revisa la configuración.', code: 'API_KEY_INVALID', retryable: false };
+      return { message: 'La credencial del servicio de IA no es válida. Revisa la configuración.', code: 'API_KEY_INVALID', retryable: false, category: 'CONFIGURATION_ERROR' };
     }
     if (message.includes('not found') && message.includes('model')) {
-      return { message: 'El modelo configurado no está disponible.', code: 'MODEL_UNAVAILABLE', retryable: false };
+      return { message: 'El modelo configurado no está disponible.', code: 'MODEL_UNAVAILABLE', retryable: false, category: 'CONFIGURATION_ERROR' };
     }
     if (message.includes('invalid') && message.includes('argument')) {
-      return { message: 'La solicitud al servicio de IA no es válida.', code: 'INVALID_REQUEST', retryable: false };
+      return { message: 'La solicitud al servicio de IA no es válida.', code: 'INVALID_REQUEST', retryable: false, category: 'INVALID_RESPONSE' };
     }
     if (message.includes('too long') || message.includes('context length')) {
-      return { message: 'El contexto de la entrevista es demasiado largo.', code: 'CONTEXT_TOO_LONG', retryable: false };
+      return { message: 'El contexto de la entrevista es demasiado largo.', code: 'CONTEXT_TOO_LONG', retryable: false, category: 'INVALID_RESPONSE' };
     }
 
     // Transitorios: sí reintentar
-    if (message.includes('quota') || message.includes('resource_exhausted') || message.includes('agotó la cuota') || message.includes('429')) {
-      return { message: 'Se agotó la cuota del servicio de IA. Espera o revisa el uso del proyecto; no reintentaremos automáticamente.', code: 'QUOTA_EXCEEDED', retryable: false };
+    if (message.includes('quota') || message.includes('resource_exhausted') || message.includes('agotó la cuota') || message.includes('429') || message.includes('límite de uso')) {
+      return { message: 'Se agotó la cuota del servicio de IA. Espera o revisa el uso del proyecto; no reintentaremos automáticamente.', code: 'QUOTA_EXCEEDED', retryable: false, category: 'RATE_LIMIT_ERROR' };
     }
-    if (message.includes('rate limit') || message.includes('too many requests')) {
-      return { message: 'Demasiadas solicitudes seguidas. Reintentando…', code: 'RATE_LIMIT_EXCEEDED', retryable: true };
+    if (message.includes('401') || message.includes('unauthenticated')) {
+      return { message: 'La sesión no está autorizada para usar el servicio de IA. Inicia sesión nuevamente.', code: 'UNAUTHENTICATED', retryable: false, category: 'AUTHENTICATION_ERROR' };
     }
-    if (message.includes('overloaded') || message.includes('unavailable') || message.includes('503')) {
-      return { message: 'El servicio de IA está saturado temporalmente. Reintentando…', code: 'SERVICE_UNAVAILABLE', retryable: true };
+    if (message.includes('403') || message.includes('permission denied')) {
+      return { message: 'El servicio de IA rechazó los permisos de esta solicitud.', code: 'PERMISSION_DENIED', retryable: false, category: 'PERMISSION_ERROR' };
+    }
+    if (/\b5\d\d\b/.test(message) || message.includes('internal server error')) {
+      return { message: 'El servidor del servicio de IA presentó un error temporal.', code: 'SERVICE_UNAVAILABLE', retryable: true, category: 'PROVIDER_ERROR' };
+    }
+    if (message.includes('overloaded') || message.includes('unavailable')) {
+      return { message: 'El servicio de IA está temporalmente no disponible.', code: 'SERVICE_UNAVAILABLE', retryable: true, category: 'PROVIDER_ERROR' };
     }
     if (message.includes('deadline') || message.includes('timeout') || message.includes('timed out')) {
-      return { message: 'El servicio de IA tardó demasiado. Puedes reintentar.', code: 'TIMEOUT', retryable: true };
+      return { message: 'El servicio de IA tardó demasiado. Puedes reintentar.', code: 'TIMEOUT_ERROR', retryable: true, category: 'TIMEOUT_ERROR' };
     }
     if (message.includes('network') || message.includes('fetch') || message.includes('connection') || message.includes('offline')) {
-      return { message: 'Se perdió la conexión. Revisa tu red y reintenta.', code: 'NETWORK_ERROR', retryable: true };
+      return { message: 'Se perdió la conexión. Revisa tu red y reintenta.', code: 'NETWORK_ERROR', retryable: true, category: 'NETWORK_ERROR' };
     }
 
-    return { message: 'Error al comunicarse con el servicio de IA. Puedes reintentar.', code: 'UNKNOWN_ERROR', retryable: true };
+    return { message: 'Error al comunicarse con el servicio de IA. Puedes reintentar.', code: 'UNKNOWN_ERROR', retryable: true, category: 'UNKNOWN_ERROR' };
+  }
+
+  private createOperationId(): string {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      return `ai-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
   }
 
   /** Marca de tiempo para diagnóstico de latencia (solo en desarrollo). */
-  private latencyMark(label: string, startMs: number): void {
+  private latencyMark(label: string, startMs: number, outcome = 'ok'): void {
     if (import.meta.env.DEV) {
       const elapsed = Math.round(performance.now() - startMs);
-      console.debug(`[latencia] ${label}: ${elapsed} ms`);
+      const normalizedLabel = label.toLowerCase();
+      const isLocal = normalizedLabel.includes('local') || normalizedLabel.includes('predefinido');
+      console.debug('[ai.operation]', {
+        operationId: this.createOperationId(),
+        operationType: label,
+        durationMs: elapsed,
+        outcome: isLocal || outcome === 'ok' || outcome === 'local' ? 'success' : 'error',
+        ...(isLocal && outcome !== 'ok' && outcome !== 'local' ? { fallbackReason: outcome } : {}),
+        ...(!isLocal && outcome !== 'ok' && outcome !== 'local' ? { category: outcome } : {}),
+        engine: isLocal ? 'local' : 'gemini',
+      });
     }
   }
 
-  private static sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
 }
 
 // Instancia singleton

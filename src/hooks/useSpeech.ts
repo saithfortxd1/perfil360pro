@@ -15,6 +15,9 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SIMULATOR_VOICE_CONFIG } from '@/services/ai/voiceConfig';
+import { choosePreferredVoice, inferVoiceGender } from '@/services/ai/voiceSelection';
+import { readVoicePreference, readVoiceRate, writeVoicePreference, writeVoiceRate } from '@/services/ai/voicePreferences';
 
 /* ---------------------------------------------------------------- */
 /* Tipos de reconocimiento (no existen en lib.dom de forma estable)  */
@@ -98,12 +101,15 @@ export interface UseSpeechReturn {
   pauseSpeaking: () => void;
   resumeSpeaking: () => void;
   voices: VoiceOption[];
+  voicesLoading: boolean;
   /** Voces del sistema excluidas de la lista principal. */
   excludedSystemVoices: VoiceOption[];
   includeSystemVoices: boolean;
   setIncludeSystemVoices: (value: boolean) => void;
   selectedVoice: VoiceOption | null;
+  selectedVoiceURI: string | null;
   selectVoice: (voiceURI: string) => void;
+  refreshVoices: () => void;
   rate: number;
   setRate: (rate: number) => void;
   previewVoice: (voiceURI?: string, text?: string) => void;
@@ -118,7 +124,6 @@ export interface UseSpeechReturn {
 /* ---------------------------------------------------------------- */
 
 const VOICE_PREFERENCE_KEY = 'perfil360.voice.uri';
-const RATE_PREFERENCE_KEY = 'perfil360.voice.rate';
 const INCLUDE_SYSTEM_KEY = 'perfil360.voice.includeSystem';
 
 const LATIN_SPANISH_REGIONS = ['es-mx', 'es-us', 'es-419', 'es-ar', 'es-co', 'es-cl', 'es-pe', 'es-ve', 'es-uy', 'es-ec', 'es-419'];
@@ -160,14 +165,17 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
   const [transcript, setTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [rawVoices, setRawVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voicesLoading, setVoicesLoading] = useState(true);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string | null>(null);
-  const [rate, setRateState] = useState(1);
+  const [rate, setRateState] = useState<number>(SIMULATOR_VOICE_CONFIG.DEFAULT_RATE);
   const [includeSystemVoices, setIncludeSystemVoicesState] = useState(false);
   const [voicesNotice, setVoicesNotice] = useState<string | null>(null);
   const [micProbe, setMicProbe] = useState<MicProbeResult | null>(null);
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const processedFinalResultRefs = useRef<Map<number, string>>(new Map());
   const synthRef = useRef<SpeechSynthesis | null>(null);
+  const voiceLoadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptHandlerRef = useRef(onTranscript);
   const errorHandlerRef = useRef(onError);
 
@@ -186,33 +194,41 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
   /* --------------------------- TTS: voces --------------------------- */
 
   useEffect(() => {
-    if (!supported.tts) return;
+    if (!supported.tts) {
+      setVoicesLoading(false);
+      return;
+    }
 
     const synth = window.speechSynthesis;
     synthRef.current = synth;
 
-    const loadVoices = () => {
-      const list = synth.getVoices();
-      if (list.length > 0) setRawVoices(list);
+    const finishVoiceLoading = (list: SpeechSynthesisVoice[]) => {
+      setRawVoices(list);
+      setVoicesLoading(false);
+      if (voiceLoadTimeoutRef.current) clearTimeout(voiceLoadTimeoutRef.current);
+      voiceLoadTimeoutRef.current = null;
     };
 
-    loadVoices();
+    const initialVoices = synth.getVoices();
+    if (initialVoices.length > 0) finishVoiceLoading(initialVoices);
+    else {
+      setVoicesLoading(true);
+      voiceLoadTimeoutRef.current = setTimeout(() => finishVoiceLoading(synth.getVoices()), 1200);
+    }
+    const loadVoices = () => finishVoiceLoading(synth.getVoices());
     synth.addEventListener?.('voiceschanged', loadVoices);
 
     // Preferencias persistidas
     if (typeof localStorage !== 'undefined') {
-      const savedUri = localStorage.getItem(voicePreferenceKey);
+      const savedUri = readVoicePreference(localStorage, voicePreferenceKey);
       setSelectedVoiceURI(savedUri);
-      const savedRate = localStorage.getItem(RATE_PREFERENCE_KEY);
-      if (savedRate) {
-        const parsed = Number(savedRate);
-        if (Number.isFinite(parsed) && parsed >= 0.5 && parsed <= 1.5) setRateState(parsed);
-      }
+      setRateState(readVoiceRate(localStorage, SIMULATOR_VOICE_CONFIG.DEFAULT_RATE));
       if (localStorage.getItem(INCLUDE_SYSTEM_KEY) === 'true') setIncludeSystemVoicesState(true);
     }
 
     return () => {
       synth.removeEventListener?.('voiceschanged', loadVoices);
+      if (voiceLoadTimeoutRef.current) clearTimeout(voiceLoadTimeoutRef.current);
     };
   }, [supported.tts, voicePreferenceKey]);
 
@@ -229,8 +245,8 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
         voice,
         name: voice.name,
         lang: voiceLang,
-        // Web Speech API no declara género: no lo deducimos del nombre.
-        gender: 'unknown',
+        // Web Speech no publica género; solo conservamos una pista si el proveedor lo declara explícitamente.
+        gender: inferVoiceGender(voice.name, voice.voiceURI),
         isSpanish: voiceLang.toLowerCase().startsWith('es'),
         isLatinSpanish: isLatinSpanish(voiceLang),
         isSystemVoice: isSystemVoice(voice),
@@ -240,23 +256,16 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
     return result.sort((a, b) => rankVoice(a) - rankVoice(b));
   }, [rawVoices]);
 
-  const excludedSystemVoices = useMemo(
-    () => allVoices.filter((option) => option.isSystemVoice),
-    [allVoices],
-  );
+  const spanishVoices = useMemo(() => allVoices.filter((option) => option.isSpanish), [allVoices]);
+  const excludedSystemVoices = useMemo(() => spanishVoices.filter((option) => option.isSystemVoice), [spanishVoices]);
 
   const voices = useMemo(
-    () => (includeSystemVoices ? allVoices : allVoices.filter((option) => !option.isSystemVoice)),
-    [allVoices, includeSystemVoices],
+    () => (includeSystemVoices ? spanishVoices : spanishVoices.filter((option) => !option.isSystemVoice)),
+    [spanishVoices, includeSystemVoices],
   );
 
   const selectedVoice = useMemo<VoiceOption | null>(() => {
-    if (voices.length === 0) return null;
-    if (selectedVoiceURI) {
-      const found = voices.find((option) => option.voice.voiceURI === selectedVoiceURI);
-      if (found) return found;
-    }
-    return voices.find((option) => option.isLatinSpanish) ?? voices.find((option) => option.isSpanish) ?? voices[0] ?? null;
+    return choosePreferredVoice(voices, selectedVoiceURI);
   }, [voices, selectedVoiceURI]);
 
   // Aviso cuando no hay voces válidas (no sustituimos en silencio).
@@ -269,24 +278,44 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
       setVoicesNotice('El navegador todavía no ha cargado ninguna voz.');
       return;
     }
+    if (selectedVoiceURI && !selectedVoice) {
+      setVoicesNotice('La voz guardada ya no está disponible. Selecciona otra voz española; mientras tanto, el navegador conserva su voz predeterminada.');
+      return;
+    }
     if (voices.length === 0) {
-      setVoicesNotice(
-        'No hay voces profesionales disponibles. Solo se detectaron voces del sistema (Microsoft), excluidas por defecto. Puedes habilitarlas desde la configuración de voz.',
-      );
+      setVoicesNotice('Este navegador no ofrece voces adicionales en español. Se mantiene disponible la voz predeterminada del navegador.');
       return;
     }
     setVoicesNotice(null);
-  }, [supported.tts, rawVoices.length, voices.length]);
+  }, [supported.tts, rawVoices.length, voices.length, selectedVoiceURI, selectedVoice]);
 
   const selectVoice = useCallback((voiceURI: string) => {
+    if (!voices.some((option) => option.voice.voiceURI === voiceURI)) return;
     setSelectedVoiceURI(voiceURI);
-    if (typeof localStorage !== 'undefined') localStorage.setItem(voicePreferenceKey, voiceURI);
-  }, [voicePreferenceKey]);
+    if (typeof localStorage !== 'undefined') writeVoicePreference(localStorage, voicePreferenceKey, voiceURI);
+  }, [voicePreferenceKey, voices]);
 
   const setRate = useCallback((value: number) => {
-    const clamped = Math.min(1.5, Math.max(0.5, value));
+    const clamped = typeof localStorage !== 'undefined'
+      ? writeVoiceRate(localStorage, value)
+      : Math.min(1.5, Math.max(0.5, value));
     setRateState(clamped);
-    if (typeof localStorage !== 'undefined') localStorage.setItem(RATE_PREFERENCE_KEY, String(clamped));
+  }, []);
+
+  const refreshVoices = useCallback(() => {
+    setVoicesLoading(true);
+    const list = synthRef.current?.getVoices() ?? [];
+    if (list.length > 0) {
+      setRawVoices(list);
+      setVoicesLoading(false);
+      return;
+    }
+    if (voiceLoadTimeoutRef.current) clearTimeout(voiceLoadTimeoutRef.current);
+    voiceLoadTimeoutRef.current = setTimeout(() => {
+      setRawVoices(synthRef.current?.getVoices() ?? []);
+      setVoicesLoading(false);
+      voiceLoadTimeoutRef.current = null;
+    }, 1200);
   }, []);
 
   const setIncludeSystemVoices = useCallback((value: boolean) => {
@@ -325,9 +354,9 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
   const speak = useCallback((text: string) => speakWith(text, selectedVoice, rate), [speakWith, selectedVoice, rate]);
 
   const previewVoice = useCallback(
-    (voiceURI?: string, text = 'Hola, soy su entrevistadora. ¿Podemos comenzar la entrevista?') => {
+    (voiceURI?: string, text = 'Hola, soy tu entrevistador en Perfil 360 AI. ¿Empezamos?') => {
       const target = voiceURI
-        ? voices.find((option) => option.voice.voiceURI === voiceURI) ?? selectedVoice
+        ? voices.find((option) => option.voice.voiceURI === voiceURI) ?? null
         : selectedVoice;
       speakWith(text, target, rate);
     },
@@ -365,7 +394,11 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
         const result = event.results[i];
         if (!result) continue;
         const segment = result[0]?.transcript ?? '';
-        if (result.isFinal) finalText += segment;
+        if (result.isFinal) {
+          if (!segment || processedFinalResultRefs.current.get(i) === segment) continue;
+          processedFinalResultRefs.current.set(i, segment);
+          finalText += segment;
+        }
         else interimText += segment;
       }
 
@@ -411,6 +444,7 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
   const startListening = useCallback(() => {
     const recognition = recognitionRef.current;
     if (!recognition) return;
+    processedFinalResultRefs.current.clear();
     setTranscript('');
     setInterimTranscript('');
     try {
@@ -482,11 +516,14 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
     pauseSpeaking,
     resumeSpeaking,
     voices,
+    voicesLoading,
     excludedSystemVoices,
     includeSystemVoices,
     setIncludeSystemVoices,
     selectedVoice,
+    selectedVoiceURI,
     selectVoice,
+    refreshVoices,
     rate,
     setRate,
     previewVoice,

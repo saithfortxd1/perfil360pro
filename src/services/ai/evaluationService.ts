@@ -1,7 +1,9 @@
 import { getFirebaseFirestore } from '@/services/firebase/firebase';
 import { geminiService } from '@/services/ai/geminiService';
-import type { ChatMessage } from '@/types/ai';
+import type { AiErrorCategory, ChatMessage } from '@/types/ai';
 import { parseEvaluationResponse, type EvaluationResult } from './evaluationResponse';
+import { generateLocalEvaluation } from './localInterviewFallback';
+import { createSafePersistenceFailure } from './errorClassification';
 import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
 export type { EvaluationResult } from './evaluationResponse';
@@ -28,13 +30,13 @@ export interface EvaluationInput {
  */
 export async function evaluatePerformance(
   input: EvaluationInput
-): Promise<{ ok: true; value: EvaluationResult } | { ok: false; error: { message: string; code: string; retryable: boolean } }> {
+): Promise<{ ok: true; value: EvaluationResult } | { ok: false; error: { message: string; code: string; retryable: boolean; category?: AiErrorCategory } }> {
+  const startedAt = performance.now();
+  const operationId = createEvaluationOperationId();
   const { messages, scenarioId, scenarioState } = input;
 
   // Filtrar mensajes del usuario y del modelo
-  const userMessages = messages.filter(m => m.role === 'user');
-  const modelMessages = messages.filter(m => m.role === 'model');
-
+  const userMessages = messages.filter(m => m.role === 'user' && !m.metadata?.isCandidateName);
   if (userMessages.length === 0) {
     return {
       ok: false,
@@ -42,37 +44,78 @@ export async function evaluatePerformance(
     };
   }
 
+  if (geminiService.isUsingFallback()) {
+    logEvaluation(operationId, startedAt, 'success', 'local');
+    return { ok: true, value: generateLocalEvaluation(messages) };
+  }
+
   // Construir prompt de evaluación
-  const evaluationPrompt = buildEvaluationPrompt(scenarioId, userMessages, modelMessages, scenarioState);
+  const evaluationPrompt = buildEvaluationPrompt(scenarioId, messages, scenarioState);
 
   try {
     // Usar generateContent para no contaminar la sesión de chat activa
-    const result = await geminiService.generateContent(evaluationPrompt);
+    const result = await geminiService.generateContent(evaluationPrompt, undefined, 'evaluation');
 
     if (!result.ok) {
-      return {
-        ok: false,
-        error: { message: result.error.message, code: result.error.code, retryable: result.error.retryable },
-      };
+      const local = generateLocalEvaluation(messages);
+      logEvaluation(operationId, startedAt, 'success', 'local');
+      return { ok: true, value: { ...local, summary: `[Evaluación local; Gemini respondió ${result.error.code}] ${local.summary}` } };
     }
 
     // Parsear la respuesta del modelo
-    const evaluation = parseEvaluationResponse(result.value);
+    let evaluation: EvaluationResult;
+    try {
+      evaluation = parseEvaluationResponse(result.value);
+    } catch {
+      const local = generateLocalEvaluation(messages);
+      logEvaluation(operationId, startedAt, 'success', 'local');
+      return { ok: true, value: { ...local, summary: `[Evaluación local; respuesta de IA inválida o truncada] ${local.summary}` } };
+    }
 
     // Guardar en Firestore
     await saveEvaluationToFirestore(input.userId, evaluation);
 
+    logEvaluation(operationId, startedAt, 'success', 'gemini');
     return { ok: true, value: evaluation };
-  } catch (error) {
+  } catch {
+    logEvaluation(operationId, startedAt, 'error', geminiService.isUsingFallback() ? 'local' : 'gemini', 'PERSISTENCE_ERROR');
+    const persistenceError = createSafePersistenceFailure(
+      'EVALUATION_PERSISTENCE_ERROR',
+      'No se pudo guardar la evaluación en el historial del perfil.',
+    );
     return {
       ok: false,
       error: {
-        message: error instanceof Error ? error.message : 'Error al evaluar desempeño',
-        code: 'EVALUATION_ERROR',
-        retryable: true,
+        ...persistenceError,
       },
     };
   }
+}
+
+function createEvaluationOperationId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `evaluation-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+function logEvaluation(
+  operationId: string,
+  startedAt: number,
+  outcome: 'success' | 'error',
+  engine: 'gemini' | 'local',
+  category?: string,
+): void {
+  if (!import.meta.env.DEV) return;
+  console.info('[ai.operation]', {
+    operationId,
+    operationType: 'evaluation',
+    durationMs: Math.round(performance.now() - startedAt),
+    outcome,
+    ...(category ? { category } : {}),
+    engine,
+  });
 }
 
 /**
@@ -80,14 +123,13 @@ export async function evaluatePerformance(
  */
 function buildEvaluationPrompt(
   scenarioId: string,
-  userMessages: ChatMessage[],
-  modelMessages: ChatMessage[],
+  messages: ChatMessage[],
   scenarioState: { progress: number; resources: Record<string, number> }
 ): string {
-  const conversation = userMessages.map((m, i) => {
-    const modelResponse = modelMessages[i]?.content || '';
-    return `Usuario: ${m.content}\nEntrevistador: ${modelResponse}`;
-  }).join('\n\n');
+  const conversation = messages
+    .filter((message) => !message.metadata?.isCandidateName)
+    .map((message) => `${message.role === 'user' ? 'Candidato' : 'Entrevistador'}: ${message.content}`)
+    .join('\n');
 
   return `[EVALUACIÓN DE DESEMPEÑO]
 
@@ -166,7 +208,7 @@ export async function getLatestEvaluation(userId: string): Promise<EvaluationRes
       evaluatedAt: data.lastEvaluation.evaluatedAt ?? 0,
     };
   } catch (error) {
-    console.error('[EvaluationService] Error fetching evaluation:', error);
+    console.error('[EvaluationService] No se pudo leer la evaluación guardada (PERSISTENCE_ERROR).');
     return null;
   }
 }

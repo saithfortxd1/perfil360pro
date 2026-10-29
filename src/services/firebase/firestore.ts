@@ -44,6 +44,7 @@ function normalizeProfile(data: DocumentData | undefined): StoredProfile {
     headline: typeof source.headline === 'string' ? source.headline : '',
     bio: typeof source.bio === 'string' ? source.bio : '',
     goal: typeof source.goal === 'string' ? source.goal : '',
+    education: typeof source.education === 'string' ? source.education : '',
     skills,
     yearsOfExperience: typeof source.yearsOfExperience === 'number' ? source.yearsOfExperience : 0,
     schemaVersion: typeof source.schemaVersion === 'number' ? source.schemaVersion : PROFILE_SCHEMA_VERSION,

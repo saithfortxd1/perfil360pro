@@ -17,7 +17,7 @@ service cloud.firestore {
     }
 
     function allowedProfileFields() {
-      return ['fullName', 'headline', 'bio', 'goal', 'skills', 'yearsOfExperience', 'updatedAt'].toSet();
+      return ['fullName', 'headline', 'bio', 'goal', 'education', 'skills', 'yearsOfExperience', 'updatedAt'].toSet();
     }
 
     function allowedUserProfileFields() {

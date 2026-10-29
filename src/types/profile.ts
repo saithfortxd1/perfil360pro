@@ -8,6 +8,7 @@ export interface ProfileDraft {
   headline: string;
   bio: string;
   goal: string;
+  education?: string;
   skills: string[];
   yearsOfExperience: number;
 }

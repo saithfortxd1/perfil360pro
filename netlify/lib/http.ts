@@ -22,7 +22,7 @@ export function buildCorsHeaders(requestOrigin: string | null): Record<string, s
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Operation-Id',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
   };
@@ -48,6 +48,21 @@ export function preflightResponse(requestOrigin: string | null): Response {
 }
 
 /** Error seguro para el cliente: mensaje claro, sin stack ni detalles internos. */
-export function errorResponse(message: string, status: number, requestOrigin: string | null, code?: string): Response {
-  return jsonResponse({ ok: false, error: { message, ...(code ? { code } : {}) } }, status, requestOrigin);
+export function errorResponse(
+  message: string,
+  status: number,
+  requestOrigin: string | null,
+  code?: string,
+  metadata?: { category?: string; sourceCode?: string; sourceStatus?: number },
+): Response {
+  return jsonResponse({
+    ok: false,
+    error: {
+      message,
+      ...(code ? { code } : {}),
+      ...(metadata?.category ? { category: metadata.category } : {}),
+      ...(metadata?.sourceCode ? { sourceCode: metadata.sourceCode } : {}),
+      ...(metadata?.sourceStatus !== undefined ? { sourceStatus: metadata.sourceStatus } : {}),
+    },
+  }, status, requestOrigin);
 }

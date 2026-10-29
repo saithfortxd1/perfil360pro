@@ -16,6 +16,7 @@ export function ProfilePanel({ user, initialProfile }: ProfilePanelProps) {
     headline: initialProfile?.headline || '',
     bio: initialProfile?.bio || '',
     goal: initialProfile?.goal || '',
+    education: initialProfile?.education || '',
     skills: (initialProfile?.skills || []).join(', '),
     yearsOfExperience: String(initialProfile?.yearsOfExperience || 0),
   });
@@ -45,6 +46,7 @@ export function ProfilePanel({ user, initialProfile }: ProfilePanelProps) {
           headline: result.value.headline,
           bio: result.value.bio,
           goal: result.value.goal,
+          education: result.value.education || '',
           skills: result.value.skills.join(', '),
           yearsOfExperience: String(result.value.yearsOfExperience),
         });
@@ -76,6 +78,7 @@ export function ProfilePanel({ user, initialProfile }: ProfilePanelProps) {
       headline: formData.headline.trim(),
       bio: formData.bio.trim(),
       goal: formData.goal.trim(),
+      education: formData.education.trim(),
       skills: formData.skills.split(',').map((s) => s.trim()).filter(Boolean),
       yearsOfExperience: parseInt(formData.yearsOfExperience, 10) || 0,
     };
@@ -170,6 +173,17 @@ export function ProfilePanel({ user, initialProfile }: ProfilePanelProps) {
               value={formData.goal}
               onChange={(e) => setFormData({ ...formData, goal: e.target.value })}
               placeholder="Quiero analizar mi perfil para... (opcional)"
+              className="w-full rounded-md border border-ink-700 bg-ink-800/80 px-3.5 py-2.5 text-sm text-mist-100 focus:border-signal-400 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="education" className="block text-xs font-medium text-mist-300">Estudios y formación</label>
+            <textarea
+              id="education"
+              rows={2}
+              value={formData.education}
+              onChange={(e) => setFormData({ ...formData, education: e.target.value })}
+              placeholder="Carrera, institución, certificaciones relevantes..."
               className="w-full rounded-md border border-ink-700 bg-ink-800/80 px-3.5 py-2.5 text-sm text-mist-100 focus:border-signal-400 focus:outline-none"
             />
           </div>

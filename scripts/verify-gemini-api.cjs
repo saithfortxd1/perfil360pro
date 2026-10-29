@@ -102,6 +102,7 @@ async function main() {
 
     let authenticated = true;
     let allowed = true;
+    let failRateLimit = false;
     let textProviderCalls = 0;
     let sentBody;
     global.fetch = async (_url, options) => {
@@ -117,17 +118,27 @@ async function main() {
         : { ok: false, reason: 'unauthenticated' },
     });
     stubModule('lib/rateLimit.js', {
-      checkAndConsumeGeminiRateLimit: async () => ({ ok: allowed, message: 'Límite local' }),
+      checkAndConsumeGeminiRateLimit: async () => {
+        if (failRateLimit) throw new Error('PRIVATE_RATE_LIMIT_DETAIL');
+        return { ok: allowed, message: 'Límite local' };
+      },
     });
     stubModule('lib/http.js', {
-      errorResponse: (message, status, _origin, code) => Response.json({ ok: false, error: { message, code } }, { status }),
+      errorResponse: (message, status, _origin, code, metadata) => Response.json({
+        ok: false,
+        error: { message, ...(code ? { code } : {}), ...(metadata ?? {}) },
+      }, { status }),
       jsonResponse: (body, status) => Response.json(body, { status }),
       preflightResponse: () => new Response(null, { status: 204 }),
     });
     const { default: handler } = require(path.join(outDir, 'functions/gemini.js'));
-    const makeRequest = (body) => new Request('http://localhost/api/gemini', {
+    const makeRequest = (body, operationId) => new Request('http://localhost/api/gemini', {
       method: 'POST',
-      headers: { Authorization: 'Bearer local-test-token', 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: 'Bearer local-test-token',
+        'Content-Type': 'application/json',
+        ...(operationId ? { 'X-Operation-Id': operationId } : {}),
+      },
       body: JSON.stringify(body),
     });
 
@@ -136,23 +147,31 @@ async function main() {
     check('text function returns provider text', successResponse.status === 200 && success.text === 'Respuesta local');
     check('text function forwards text using server-side generateContent', sentBody.contents[0].parts[0].text === 'Prueba');
 
+    const previousInfo = console.info;
+    const operationLogs = [];
+    console.info = (...args) => operationLogs.push(args.join(' '));
+    await handler(makeRequest({ prompt: 'Prueba' }, 'operation-test-1234'), {});
+    console.info = previousInfo;
+    check('client-supplied operation id correlates safe server telemetry', operationLogs.join(' ').includes('operation-test-1234'));
+
     process.env.GEMINI_API_KEY = 'PEGA_TU_CLAVE_AQUI';
+    const callsBeforePlaceholder = textProviderCalls;
     const placeholderResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
-    check('text function rejects the local key placeholder without provider request', placeholderResponse.status === 500 && textProviderCalls === 1);
+    check('text function rejects the local key placeholder without provider request', placeholderResponse.status === 500 && textProviderCalls === callsBeforePlaceholder);
     process.env.GEMINI_API_KEY = 'local-test-key';
 
     authenticated = false;
     const deniedResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
-    check('text function requires Firebase authentication', deniedResponse.status === 401 && textProviderCalls === 1);
+    check('text function requires Firebase authentication', deniedResponse.status === 401 && textProviderCalls === callsBeforePlaceholder);
 
     authenticated = true;
     allowed = false;
     const limitedResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
-    check('text function enforces per-user rate limit', limitedResponse.status === 429 && textProviderCalls === 1);
+    check('text function enforces per-user rate limit', limitedResponse.status === 429 && textProviderCalls === callsBeforePlaceholder);
 
     allowed = true;
     const invalidResponse = await handler(makeRequest({ contents: [{ role: 'attacker', parts: [{ text: 'Prueba' }] }] }), {});
-    check('text function rejects invalid history schema', invalidResponse.status === 400 && textProviderCalls === 1);
+    check('text function rejects invalid history schema', invalidResponse.status === 400 && textProviderCalls === callsBeforePlaceholder);
 
     const callsBeforeQuota = textProviderCalls;
     global.fetch = async () => {
@@ -174,6 +193,46 @@ async function main() {
       quotaResponse.status === 429 &&
       quotaBody.error?.code === 'resource-exhausted' &&
       textProviderCalls === callsBeforeQuota + 1);
+
+    const callsBeforeProviderFailure = textProviderCalls;
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      return new Response(JSON.stringify({ error: { status: 'UNAVAILABLE', message: 'mock provider outage' } }), { status: 503 });
+    };
+    const providerFailure = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    check('text function returns provider 5xx after one request so the client can fall back locally',
+      providerFailure.status === 502 && textProviderCalls === callsBeforeProviderFailure + 1);
+
+    const callsBeforeNetworkFailure = textProviderCalls;
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      throw new TypeError('mock network failure');
+    };
+    const networkFailure = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    check('text function maps connection failure without a second provider request',
+      networkFailure.status === 502 && textProviderCalls === callsBeforeNetworkFailure + 1);
+
+    for (const upstreamStatus of [401, 403]) {
+      global.fetch = async () => {
+        textProviderCalls += 1;
+        return new Response(JSON.stringify({ error: { status: 'PERMISSION_DENIED', message: 'mock upstream auth rejection' } }), { status: upstreamStatus });
+      };
+      const providerAuthFailure = await handler(makeRequest({ prompt: 'Prueba' }), {});
+      const providerAuthBody = await providerAuthFailure.json();
+      check(`text function preserves upstream ${upstreamStatus} as provider error instead of Firebase auth`,
+        providerAuthFailure.status === 502 &&
+        providerAuthBody.error?.category === 'PROVIDER_ERROR' &&
+        providerAuthBody.error?.sourceStatus === upstreamStatus);
+    }
+
+    failRateLimit = true;
+    const persistenceFailure = await handler(makeRequest({ prompt: 'Prueba' }), {});
+    const persistenceFailureBody = await persistenceFailure.json();
+    check('text function distinguishes Firestore rate-limit failure from provider failure',
+      persistenceFailure.status === 500 &&
+      persistenceFailureBody.error?.category === 'PERSISTENCE_ERROR' &&
+      !JSON.stringify(persistenceFailureBody).includes('PRIVATE_RATE_LIMIT_DETAIL'));
+    failRateLimit = false;
 
     // Test safe error instrumentation: extracts status, message, reason, domain from ErrorInfo
     const capturedLogs = [];
@@ -200,9 +259,10 @@ async function main() {
       }), { status: 400 });
     };
 
-    const errorInfoResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
-    check('text function handles provider 400 response', errorInfoResponse.status === 400);
-    const loggedErrorLine = capturedLogs.find((log) => log.includes('[gemini] el proveedor respondió 400'));
+    const errorInfoResponse = await handler(makeRequest({ prompt: 'PRIVATE_INTERVIEW_SENTINEL' }), {});
+    const errorInfoBody = await errorInfoResponse.json();
+    check('text function normalizes provider 400 response behind an upstream error status', errorInfoResponse.status === 502 && errorInfoBody.error?.category === 'PROVIDER_ERROR');
+    const loggedErrorLine = capturedLogs.find((log) => log.includes('[gemini] operación'));
     let loggedParsed = null;
     try {
       const jsonStart = loggedErrorLine ? loggedErrorLine.indexOf('{') : -1;
@@ -212,10 +272,56 @@ async function main() {
     } catch {
       loggedParsed = null;
     }
-    check('text function logs provider status', loggedParsed?.status === 'INVALID_ARGUMENT');
-    check('text function logs provider sanitized message', loggedParsed?.message?.includes('API key not valid'));
+    check('text function logs provider source status and category', loggedParsed?.sourceStatus === 400 && loggedParsed?.category === 'PROVIDER_ERROR');
+    check('text function does not log provider message or interview prompt', !loggedParsed?.message && !capturedLogs.join(' ').includes('PRIVATE_INTERVIEW_SENTINEL'));
     check('text function logs provider reason from ErrorInfo', loggedParsed?.reason === 'API_KEY_INVALID');
     check('text function logs provider domain from ErrorInfo', loggedParsed?.domain === 'googleapis.com');
+
+    // Test: Scenario request uses structured JSON response schema and higher token limit
+    let capturedScenarioRequest = null;
+    global.fetch = async (_url, options) => {
+      textProviderCalls += 1;
+      capturedScenarioRequest = JSON.parse(options.body);
+      return new Response(JSON.stringify({
+        candidates: [{
+          finishReason: 'STOP',
+          content: {
+            parts: [{
+              text: JSON.stringify({
+                scenarios: [
+                  { id: 'sc_1', title: 'Senior Dev', description: 'Entrevista técnica', difficulty: 'medio' },
+                ],
+              }),
+            }],
+          },
+        }],
+      }), { status: 200 });
+    };
+    const scenarioPrompt = 'Genera 5 escenarios de entrevista laboral para este perfil profesional en JSON con difficulty';
+    const scenarioRes = await handler(makeRequest({ prompt: scenarioPrompt }), {});
+    const scenarioJson = await scenarioRes.json();
+    check('scenario request enables JSON schema structured output in generateContent',
+      capturedScenarioRequest?.generationConfig?.responseMimeType === 'application/json' &&
+      capturedScenarioRequest?.generationConfig?.responseSchema?.properties?.scenarios !== undefined);
+    check('scenario request sets higher token limit (>= 1500)',
+      capturedScenarioRequest?.generationConfig?.maxOutputTokens >= 1500);
+    check('scenario response passes through successfully with structured JSON text',
+      scenarioRes.status === 200 && scenarioJson.ok === true && typeof scenarioJson.text === 'string');
+
+    // Test: Truncated response detection (finishReason = MAX_TOKENS)
+    global.fetch = async () => {
+      textProviderCalls += 1;
+      return new Response(JSON.stringify({
+        candidates: [{
+          finishReason: 'MAX_TOKENS',
+          content: { parts: [{ text: '{"scenarios": [{"id": "sc_trun' }] },
+        }],
+      }), { status: 200 });
+    };
+    const truncatedRes = await handler(makeRequest({ prompt: scenarioPrompt }), {});
+    const truncatedJson = await truncatedRes.json();
+    check('truncated response flags finishReason MAX_TOKENS without crashing',
+      truncatedRes.status === 200 && truncatedJson.finishReason === 'MAX_TOKENS');
 
     // Test safe error instrumentation: non-JSON body response
     global.fetch = async () => {
@@ -225,7 +331,7 @@ async function main() {
     capturedLogs.length = 0;
     const htmlResponse = await handler(makeRequest({ prompt: 'Prueba' }), {});
     check('text function handles provider non-JSON failure', htmlResponse.status === 502);
-    const loggedNonJsonLine = capturedLogs.find((log) => log.includes('[gemini] el proveedor respondió 502'));
+    const loggedNonJsonLine = capturedLogs.find((log) => log.includes('[gemini] operación'));
     let loggedNonJsonParsed = null;
     try {
       const jsonStart = loggedNonJsonLine ? loggedNonJsonLine.indexOf('{') : -1;

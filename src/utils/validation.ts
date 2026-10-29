@@ -94,6 +94,9 @@ export function validateProfileDraft(input: unknown): Result<ProfileDraft> {
   const goal = validateLength(source.goal, LIMITS.goal, 'goal', 'El objetivo');
   if (!goal.ok) return goal;
 
+  const education = validateLength(source.education ?? '', { min: 0, max: 800 }, 'education', 'La formación');
+  if (!education.ok) return education;
+
   const rawSkills = Array.isArray(source.skills) ? source.skills : [];
   const skills = [
     ...new Set(
@@ -126,6 +129,7 @@ export function validateProfileDraft(input: unknown): Result<ProfileDraft> {
     headline: headline.value,
     bio: bio.value,
     goal: goal.value,
+    education: education.value,
     skills,
     yearsOfExperience: Math.trunc(years),
   });

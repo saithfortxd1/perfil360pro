@@ -19,6 +19,7 @@
     "verify:dashboard": "node scripts/verify-dashboard.cjs",
     "verify:pcm": "node scripts/verify-pcm.cjs",
     "verify:gemini": "node scripts/verify-gemini-api.cjs",
+    "verify:local-interview": "node --experimental-strip-types scripts/verify-local-interview.mjs",
     "verify:profile": "node scripts/verify-profile-flow.cjs"
   },
   "dependencies": {

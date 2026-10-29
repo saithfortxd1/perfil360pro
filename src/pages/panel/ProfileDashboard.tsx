@@ -44,6 +44,7 @@ function makeDraft(user: SessionUser, profile: Partial<ProfileDraft>): ProfileDr
     headline: profile.headline || '',
     bio: profile.bio || '',
     goal: profile.goal || '',
+    education: profile.education || '',
     skills: profile.skills ? [...profile.skills] : [],
     yearsOfExperience: profile.yearsOfExperience ?? 0,
   };
@@ -218,6 +219,7 @@ export function ProfileDashboard({ user, role, initialProfile, onSignOut }: Prof
         headline: extracted.headline || current.headline,
         bio: extracted.bio || current.bio,
         goal: extracted.goal || current.goal,
+        education: extracted.education || current.education,
         skills: extracted.skills.length ? extracted.skills : current.skills,
         yearsOfExperience: extracted.yearsOfExperience || current.yearsOfExperience,
       }));
@@ -375,6 +377,7 @@ export function ProfileDashboard({ user, role, initialProfile, onSignOut }: Prof
                       <Field label="Años de experiencia" value={String(draft.yearsOfExperience)} onChange={(value) => updateField('yearsOfExperience', Math.max(0, Math.min(60, Number.parseInt(value, 10) || 0)))} placeholder="0" />
                       <Field label="Biografía técnica" value={draft.bio} onChange={(value) => updateField('bio', value)} placeholder="Resume tu experiencia, fortalezas y logros..." multiline />
                       <Field label="Objetivo profesional" value={draft.goal} onChange={(value) => updateField('goal', value)} placeholder="¿Qué oportunidades buscas?" multiline />
+                      <Field label="Estudios y formación" value={draft.education || ''} onChange={(value) => updateField('education', value)} placeholder="Carrera, institución y certificaciones relevantes" multiline />
                     </div>
 
                     <div className="mt-6 border-t border-slate-800 pt-5">

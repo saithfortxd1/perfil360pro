@@ -19,9 +19,10 @@ function RouteScrollReset() {
 export function AppShell() {
   const { pathname } = useLocation();
   const isDashboard = pathname === paths.panel;
+  const isSimulator = pathname === paths.simulador;
 
   return (
-    <div className="flex min-h-dvh flex-col">
+    <div className={isSimulator ? 'flex h-dvh min-h-0 flex-col' : 'flex min-h-dvh flex-col'}>
       <a
         href="#contenido-principal"
         className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:rounded-md focus:bg-signal-400 focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-ink-950"
@@ -32,11 +33,15 @@ export function AppShell() {
       <RouteScrollReset />
       {!isDashboard ? <SiteHeader /> : null}
 
-      <main id="contenido-principal" tabIndex={-1} className="flex-1 focus-visible:outline-none">
+      <main
+        id="contenido-principal"
+        tabIndex={-1}
+        className={isSimulator ? 'min-h-0 flex-1 overflow-y-auto focus-visible:outline-none' : 'flex-1 focus-visible:outline-none'}
+      >
         <Outlet />
       </main>
 
-      {!isDashboard ? <SiteFooter /> : null}
+      {!isDashboard && !isSimulator ? <SiteFooter /> : null}
     </div>
   );
 }

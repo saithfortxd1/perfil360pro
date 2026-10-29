@@ -65,6 +65,8 @@ export interface ChatMessage {
     scenarioId?: ScenarioId;
     tokens?: number;
     model?: string;
+    isLocalFallback?: boolean;
+    isCandidateName?: boolean;
   };
 }
 
@@ -134,6 +136,7 @@ export interface SimulationContext {
 export interface SimulationSession {
   id: string;
   scenarioId: ScenarioId;
+  candidateName?: string;
   status: SimulationStatus;
   scenarioState: ScenarioState;
   messages: ChatMessage[];
@@ -170,6 +173,31 @@ export interface GeminiConfig {
   topK: number;
 }
 
+export type AiErrorCategory =
+  | 'AUTHENTICATION_ERROR'
+  | 'PERMISSION_ERROR'
+  | 'CONFIGURATION_ERROR'
+  | 'RATE_LIMIT_ERROR'
+  | 'PROVIDER_ERROR'
+  | 'NETWORK_ERROR'
+  | 'TIMEOUT_ERROR'
+  | 'INVALID_RESPONSE'
+  | 'PERSISTENCE_ERROR'
+  | 'CANCELLED'
+  | 'UNKNOWN_ERROR';
+
+/** Safe, normalized service error metadata; source details are optional and non-sensitive. */
+export interface AIServiceFailure {
+  message: string;
+  code: string;
+  retryable: boolean;
+  category?: AiErrorCategory;
+  httpStatus?: number;
+  sourceCode?: string;
+  sourceStatus?: number;
+  details?: Record<string, unknown>;
+}
+
 /** Error tipado del servicio AI */
 export class AIServiceError extends Error {
   constructor(
@@ -202,7 +230,7 @@ export type AIErrorCode =
 /** Resultado tipado para operaciones AI */
 export type AIResult<T> =
   | { ok: true; value: T }
-    | { ok: false; error: { message: string; code: string; retryable: boolean; details?: Record<string, unknown>; originalError?: Error } };
+    | { ok: false; error: AIServiceFailure & { originalError?: Error } };
 
 /** Configuración por defecto */
 export const DEFAULT_GEMINI_CONFIG: Partial<GeminiConfig> = {
